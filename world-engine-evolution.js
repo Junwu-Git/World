@@ -921,12 +921,31 @@ ${JSON.stringify(sample || [], null, 2)}
     // 蓝绿灯触发：扫描本扩展自己喂给推演的近期对话（解耦，不读酒馆的聊天扫描）
     const worldbookScanText = dialogueText || `${userMsg || ''}\n${aiMsg || ''}`;
     const worldbookSection = await window.WORLD_ENGINE_WORLDBOOK?.buildPromptSection?.(worldbookScanText) || '';
+    // 用户人设（酒馆「用户设定」里的 persona 描述）：只读参照。开关关闭、人称为空、
+    // 用户在酒馆把注入位置设为「不注入」或读取失败时一律为空，不阻断推演。
+    let personaSection = '';
+    try {
+      personaSection = await core.buildPersonaSection?.((api.getSettings ? api.getSettings() : {}).personaEnabled === true) || '';
+    } catch (error) {
+      console.error('[世界引擎] 读取用户人设失败（已隔离）', error);
+    }
     let memoryEngineSection = '';
     try {
       memoryEngineSection = window.MEMORY_ENGINE?.buildWorldEngineContext?.(state) || '';
     } catch (error) {
       // 可选跨引擎上下文必须故障隔离：记忆引擎异常不能中断世界推演。
       console.error('[世界引擎] 读取记忆引擎上下文失败（已隔离）', error);
+    }
+    // 外部数据源桥（柏宝书 / SP·数据库）：只读参照，异常与关闭都必须静默为空，不阻断推演。
+    let bridgeSection = '';
+    let bridgeHistorySection = '';
+    try {
+      bridgeSection = await window.WORLD_ENGINE_BRIDGE?.buildBridgeSection?.() || '';
+      // 历史剧情摘要独立成段：拼接在「近期对话」正前方——摘要覆盖窗口起点之前的剧情，
+      // 与近期对话时间连续，中间不隔大块 JSON，模型能把两段读成一条完整时间线。
+      bridgeHistorySection = window.WORLD_ENGINE_BRIDGE?.buildHistorySection?.() || '';
+    } catch (error) {
+      console.error('[世界引擎] 读取外部数据源桥失败（已隔离）', error);
     }
     const tonePrompt = ((api.getSettings ? api.getSettings() : {}).tonePrompt || '').trim();
     const toneSection = tonePrompt
@@ -966,17 +985,25 @@ ${JSON.stringify(sample || [], null, 2)}
 
     // [MAP] 实际发出的完整 prompt：与原模板逐字相同的拼接顺序与分隔，零语义漂移。
     // 4 段用上方的 seg*（覆写层 Final 变量）：无覆写时逐字等于原常量。
-    const prompt = segEngineRole + '\n\n' + ENTITY_ID_PROTOCOL + '\n\n' + segCausalSteps
+    // 用户宏在此展开（而非只在 callApi 出口）：引擎自建请求不走酒馆 substituteParams，
+    // {{user}}、<user> 会原样到达模型；拼装侧展开后，下方分段镜像与 _lastPrompt
+    // 才继续与实际发出字节级一致。
+    const rawPrompt = segEngineRole + '\n\n' + ENTITY_ID_PROTOCOL + '\n\n' + segCausalSteps
       + '\n\n========== 世界推演规则 ==========\n' + fullRules
       + '\n\n' + worldbookSection
+      + (personaSection ? '\n\n' + personaSection : '')
       + (memoryEngineSection ? '\n\n' + memoryEngineSection : '')
+      + (bridgeSection ? '\n\n' + bridgeSection : '')
       + '\n\n' + segStateBlock
+      + (bridgeHistorySection ? '\n\n' + bridgeHistorySection : '')
       + '\n\n' + segDialogue
       + '\n\n' + segOutputInstructions
       + '\n' + segJsonExample
       + '\n' + (extraInstruction ? '\n' + extraInstruction : '') + toneSection;
+    const prompt = core.renderUserName(rawPrompt);
 
-    // [MAP] 分段镜像（全透明展示用，只读）。各段 content 与上方 prompt 引用同一变量。
+    // [MAP] 分段镜像（全透明展示用，只读）。各段 content 与上方 prompt 引用同一变量，
+    // 并同样过用户宏展开，保证展示与实际发出字节级一致。
     // worldbookSection / toneSection / extraInstruction 为空时 content 为空字符串，展示侧标注「本轮未启用」。
     _lastPromptSegments = [
       { key: 'engine-role',    label: '① 引擎角色指令',            content: segEngineRole },
@@ -984,14 +1011,17 @@ ${JSON.stringify(sample || [], null, 2)}
       { key: 'causal-steps',   label: '③ 因果检查（10 步）',        content: segCausalSteps },
       { key: 'rules',          label: '④ 世界推演规则',            content: fullRules },
       { key: 'worldbook',      label: '⑤ 世界书注入',              content: worldbookSection },
+      { key: 'persona',        label: '⑤a 用户人设（酒馆用户设定）', content: personaSection },
       { key: 'memory-engine',  label: '⑤b 记忆引擎人物/实体注入',   content: memoryEngineSection },
+      { key: 'bridge',         label: '⑤c 外部数据源（柏宝书/数据库）', content: bridgeSection },
       { key: 'state',          label: '⑥ 当前世界状态（JSON）',     content: segStateBlock },
+      { key: 'bridge-history', label: '⑥b 历史剧情摘要（紧贴对话）',  content: bridgeHistorySection },
       { key: 'dialogue',       label: '⑦ 近期对话',                content: segDialogue },
-      { key: 'output-format',  label: '⑧ JSON 输出字段说明',       content: segOutputInstructions },
+      { key: 'output-format',  label: '⑧ JSON 输出字段说明',        content: segOutputInstructions },
       { key: 'json-example',   label: '⑨ JSON 示例',               content: segJsonExample },
       { key: 'extra-instr',    label: '⑩ 附加指令',                content: segExtraInstruction },
-      { key: 'tone',           label: '⑪ 附加提示词（用户自定义）', content: segToneSection }
-    ];
+      { key: 'tone',           label: '⑪ 附加提示词（用户自定义）',  content: segToneSection }
+    ].map(seg => ({ ...seg, content: core.renderUserName(seg.content) }));
 
     _lastPrompt = prompt;
     _lastRawResult = '';
@@ -1456,8 +1486,10 @@ ${JSON.stringify(sample || [], null, 2)}
         const aiMsg = String(chat[lastChatIdx].mes || '').trim();
 
         // 构造本批对话文本（与 performEvolution 一致：含夹在中间的 user 楼层）
-        const dialogueText = chat.slice(startChatIdx, lastChatIdx + 1)
-          .map(m => (m.is_user ? '用户' : 'AI') + '：' + core.filterDialogue(String(m.mes || '').trim(), settings))
+        // depth 相对本批切片末尾：开启「走酒馆正则」时供 minDepth/maxDepth 脚本判定楼层深浅。
+        const batchMessages = chat.slice(startChatIdx, lastChatIdx + 1);
+        const dialogueText = batchMessages
+          .map((m, idx) => (m.is_user ? '用户' : 'AI') + '：' + core.filterDialogue(String(m.mes || '').trim(), settings, null, { isUser: !!m.is_user, depth: batchMessages.length - 1 - idx }))
           .filter(line => line.length > 3)
           .join('\n');
 

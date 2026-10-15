@@ -1,22 +1,24 @@
 // 持续实体 ID 回归测试：node docs/sandbox-entity-id-test.js
-const assert = require('assert');
-const fs = require('fs');
-const vm = require('vm');
-const path = require('path');
+import assert from 'node:assert';
+import path from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const importModule = file => import(pathToFileURL(path.join(root, file)));
 
 const storage = new Map();
 global.window = global;
 global.WORLD_ENGINE_STORE = {
   getItem: key => storage.has(key) ? storage.get(key) : null,
-  setItem: (key, value) => storage.set(key, value),
+  setItem: (key, value) => storage.set(key, String(value)),
   removeItem: key => storage.delete(key)
 };
 
-const coreSource = fs.readFileSync(path.join(__dirname, '..', 'world-engine-core.js'), 'utf8');
-vm.runInThisContext(coreSource, { filename: 'world-engine-core.js' });
+// 无 script 标签 → core 的酒馆正则预加载器静默跳过（与浏览器缺模块时同款降级）
+global.document = { getElementsByTagName: () => [] };
+await importModule('world-engine-core.js');
 const core = global.WORLD_ENGINE_CORE;
-const ledgerSource = fs.readFileSync(path.join(__dirname, '..', 'world-engine-ledger.js'), 'utf8');
-vm.runInThisContext(ledgerSource, { filename: 'world-engine-ledger.js' });
+await importModule('world-engine-ledger.js');
 const ledger = global.WORLD_ENGINE_LEDGER;
 
 function legacyState() {
@@ -114,7 +116,9 @@ assert.strictEqual(ledgerChanges.filter(x => x.type === 'event_advance').length,
 assert.strictEqual(ledgerChanges.filter(x => x.type === 'wind_new').length, 0);
 
 // evolution 必须把身份协议置于不可被自定义预设覆盖的主 prompt 中。
-const evolutionSource = fs.readFileSync(path.join(__dirname, '..', 'world-engine-evolution.js'), 'utf8');
+const { readFileSync } = await import('node:fs');
+const evolutionSource = readFileSync(path.join(root, 'world-engine-evolution.js'), 'utf8');
+
 assert.match(evolutionSource, /ENTITY_ID_PROTOCOL/);
 assert.match(evolutionSource, /id: e\.id/);
 assert.match(evolutionSource, /id: f\.id/);

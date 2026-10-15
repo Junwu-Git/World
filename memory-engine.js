@@ -74,9 +74,18 @@ window.MEMORY_ENGINE = (function() {
 
   function formatMessages(messages, startLayer) {
     const ctx = context();
-    return (messages || []).map((message, i) => {
+    const list = messages || [];
+    // 走酒馆正则：逐条按用户/AI 输入过一遍酒馆「正则」面板脚本（只跑勾了「Alter Outgoing
+    // Prompt」的脚本，与酒馆发给 AI 的处理完全一致），depth 相对本切片末尾。之后 filterConversation
+    // 仍会执行本扩展正则。
+    const useStRegex = settings().filterUseStRegex === true;
+    const core = window.WORLD_ENGINE_CORE;
+    return list.map((message, i) => {
       const fallback = message?.is_user ? (ctx?.name1 || '用户') : (ctx?.name2 || '角色');
-      return `[楼层 ${Number(startLayer || 0) + i}]【${clean(message?.name) || fallback}】\n${clean(message?.mes)}`;
+      const mes = useStRegex && core?.applyStRegex
+        ? core.applyStRegex(clean(message?.mes), !!message?.is_user, list.length - 1 - i)
+        : clean(message?.mes);
+      return `[楼层 ${Number(startLayer || 0) + i}]【${clean(message?.name) || fallback}】\n${mes}`;
     }).filter(Boolean).join('\n\n');
   }
 
@@ -181,6 +190,17 @@ window.MEMORY_ENGINE = (function() {
 
   async function buildRequestPrompt(tasks, state, st) {
     const segments = [];
+    // 用户人设（酒馆「用户设定」里的 persona 描述）：只读参照，只进人物/实体提取任务
+    // （known_by 归属、用户作为知情人物等判定需要知道{{user}}是谁）。开关关闭、人称为空、
+    // 用户在酒馆把注入位置设为「不注入」或读取失败时一律为空，不阻断提取。
+    if (tasks.memory) {
+      try {
+        const personaSection = await window.WORLD_ENGINE_CORE?.buildPersonaSection?.(st.personaEnabled === true) || '';
+        if (personaSection) segments.push(personaSection);
+      } catch (error) {
+        console.error('[记忆引擎] 读取用户人设失败（已隔离）', error);
+      }
+    }
     const memoryReference = tasks.memory ? buildTaskReferenceContext(state, tasks.memory, st) : null;
     const sharesReference = Boolean(tasks.memory && tasks.small
       && Number(tasks.memory.startLayer) === Number(tasks.small.startLayer)
@@ -802,7 +822,11 @@ window.MEMORY_ENGINE = (function() {
 
   async function requestTasks(tasks, options) {
     const st = settings(), state = options?.baseState ? clone(options.baseState) : data().loadState();
-    const prompt = await buildRequestPrompt(tasks, state, st);
+    const rawPrompt = await buildRequestPrompt(tasks, state, st);
+    // 与 callApi 出口同一展开：{{user}}、<user> → 酒馆设定的 user 名称。
+    // 此处展开让调试镜像（lastDebug.prompt）与实际发出的请求字节级一致。
+    const renderUserName = window.WORLD_ENGINE_CORE?.renderUserName;
+    const prompt = typeof renderUserName === 'function' ? (renderUserName(rawPrompt) || rawPrompt) : rawPrompt;
     lastDebug = { prompt, requestPrompt: prompt, rawResult: '', apiResponse: '', parsed: null, error: '' };
     const retries = Math.max(0, Number(options?.retries ?? st.apiAutoRetries) || 0);
     for (let attempt = 0; attempt <= retries; attempt++) {

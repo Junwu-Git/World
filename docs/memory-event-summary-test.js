@@ -1,10 +1,11 @@
 // 事件记忆离线测试：node docs/memory-event-summary-test.js
-const assert = require('assert');
-const fs = require('fs');
-const path = require('path');
-const vm = require('vm');
+import assert from 'node:assert';
+import path from 'node:path';
+import fs from 'node:fs';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
-const root = path.resolve(__dirname, '..');
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const importModule = file => import(pathToFileURL(path.join(root, file)));
 const storeMap = new Map();
 const calls = [];
 const listeners = new Map();
@@ -58,8 +59,10 @@ const context = {
   eventSource: { on(name, handler) { listeners.set(name, handler); } },
   event_types: { GENERATION_ENDED: 'generation_ended' }
 };
-const sandbox = {
-  window: null,
+// 各记忆模块按 window 全局互相引用，这里以 Node global 充当该 window（测试直接读写同一对象）。
+const sandbox = global;
+sandbox.window = sandbox;
+Object.assign(sandbox, {
   __WE_SetExternalStatus(text) { if (String(text).startsWith('正在进行')) startSignals.push('status'); },
   console,
   setTimeout,
@@ -97,8 +100,7 @@ const sandbox = {
       return JSON.stringify(result);
     }
   }
-};
-sandbox.window = sandbox;
+});
 
 for (const filename of [
   'memory-engine-data.js',
@@ -107,7 +109,7 @@ for (const filename of [
   'memory-engine-big-summary-prompt.js',
   'memory-engine.js'
 ]) {
-  vm.runInNewContext(fs.readFileSync(path.join(root, filename), 'utf8'), sandbox, { filename });
+  await importModule(filename);
 }
 
 {

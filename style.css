@@ -1756,6 +1756,11 @@
   border-top: 1px solid var(--we-border);
 }
 
+/* 全局排除世界书：整组置灰（组头），条目级置灰见 .is-globally-excluded */
+.we-worldbook-group.is-book-excluded .we-worldbook-group-header {
+  opacity: 0.55;
+}
+
 .we-worldbook-group-header {
   position: sticky;
   top: 0;
@@ -1868,6 +1873,116 @@
 
 .we-worldbook-entry.is-disabled {
   opacity: 0.58;
+}
+
+/* 全局排除世界书：被排除条目置灰，分组标题带 🚫 标记 */
+.we-worldbook-entry.is-globally-excluded {
+  opacity: 0.5;
+}
+
+.we-wb-group-excluded {
+  color: var(--we-text3);
+  font-size: 9px;
+  font-weight: 400;
+}
+
+/* 全局排除区：已排除书 chips + 可添加候选列表 */
+.we-wb-excl-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 6px;
+}
+
+.we-wb-excl-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 4px 2px 8px;
+  border: 1px solid var(--we-border);
+  border-radius: 10px;
+  background: var(--we-surface);
+  font-size: 10px;
+  color: var(--we-text2);
+  max-width: 100%;
+}
+
+.we-wb-excl-chip > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.we-wb-excl-chip button {
+  padding: 0 5px;
+  border: none;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--we-text3);
+  font-size: 11px;
+  line-height: 1.4;
+  cursor: pointer;
+}
+
+.we-wb-excl-chip button:hover {
+  color: var(--we-text);
+}
+
+.we-wb-excl-empty {
+  font-size: 10px;
+  color: var(--we-text3);
+  padding: 4px 0;
+}
+
+.we-wb-excl-candidates {
+  max-height: 140px;
+  overflow-y: auto;
+  margin-top: 6px;
+  border: 1px solid var(--we-border);
+  border-radius: 6px;
+  background: var(--we-bg);
+}
+
+.we-wb-excl-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  padding: 4px 8px;
+  font-size: 10px;
+  color: var(--we-text2);
+  cursor: pointer;
+}
+
+.we-wb-excl-row + .we-wb-excl-row {
+  border-top: 1px solid var(--we-border);
+}
+
+.we-wb-excl-row:hover {
+  background: var(--we-surface);
+}
+
+.we-wb-excl-row span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.we-wb-excl-row button {
+  flex-shrink: 0;
+  padding: 1px 6px;
+  border: 1px solid var(--we-border);
+  border-radius: 4px;
+  background: var(--we-surface);
+  color: var(--we-text3);
+  font-size: 9px;
+  cursor: pointer;
+}
+
+.we-wb-excl-row button:hover {
+  border-color: var(--we-accent);
+  color: var(--we-text);
 }
 
 /* 蓝绿灯触发：条目主体（勾选+标题）占满，触发覆写下拉靠右 */

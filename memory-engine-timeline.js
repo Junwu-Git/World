@@ -170,6 +170,19 @@ window.MEMORY_ENGINE_TIMELINE = (function() {
     return ranges;
   }
 
+  // 楼层号本来就是本地计算的整数，这里再钉死为数字序列化，保证传给斜杠命令的
+  // 永远只是「N」或「N-M」形式的字面量，不含任何聊天文本。
+  function layerArg(start, end) {
+    const s = Math.trunc(Number(start)), e = Math.trunc(Number(end));
+    if (!Number.isFinite(s) || !Number.isFinite(e)) return null;
+    return s === e ? String(s) : String(Math.min(s, e)) + '-' + String(Math.max(s, e));
+  }
+
+  function slashCommand(name, start, end) {
+    const arg = layerArg(start, end);
+    return arg === null ? null : name + ' ' + arg;
+  }
+
   async function syncHidden(coveredMessageIds) {
     const wanted = coveredMessageIds instanceof Set ? coveredMessageIds : new Set(coveredMessageIds || []);
     const all = chat(), toHide = [], toUnhide = [];
@@ -181,7 +194,7 @@ window.MEMORY_ENGINE_TIMELINE = (function() {
     });
     if (!toHide.length && !toUnhide.length) return { hidden: 0, unhidden: 0 };
 
-    const ctx = context(), exec = ctx?.executeSlashCommandsWithOptions;
+    const ctx = context(), runSlash = ctx?.executeSlashCommandsWithOptions;
     const mark = (layer, hidden) => {
       const message = all[layer];
       if (!message) return;
@@ -189,18 +202,18 @@ window.MEMORY_ENGINE_TIMELINE = (function() {
       if (hidden) message.extra[HIDDEN_KEY] = true;
       else delete message.extra[HIDDEN_KEY];
     };
-    if (typeof exec === 'function') {
+    if (typeof runSlash === 'function') {
       for (const [start, end] of coalesceRanges(toUnhide)) {
         for (let i = start; i <= end; i++) mark(i, false);
-        const arg = start === end ? `${start}` : `${start}-${end}`;
-        try { await exec(`/unhide ${arg}`); }
-        catch (_) { for (let i = start; i <= end; i++) if (all[i]) all[i].is_system = false; }
+        const cmd = slashCommand('/unhide', start, end);
+        if (cmd) { try { await runSlash(cmd); }
+        catch (_) { for (let i = start; i <= end; i++) if (all[i]) all[i].is_system = false; } }
       }
       for (const [start, end] of coalesceRanges(toHide)) {
         for (let i = start; i <= end; i++) mark(i, true);
-        const arg = start === end ? `${start}` : `${start}-${end}`;
-        try { await exec(`/hide ${arg}`); }
-        catch (_) { for (let i = start; i <= end; i++) if (all[i]) all[i].is_system = true; }
+        const cmd = slashCommand('/hide', start, end);
+        if (cmd) { try { await runSlash(cmd); }
+        catch (_) { for (let i = start; i <= end; i++) if (all[i]) all[i].is_system = true; } }
       }
     } else {
       for (const layer of toUnhide) { mark(layer, false); if (all[layer]) all[layer].is_system = false; }

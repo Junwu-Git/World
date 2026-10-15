@@ -35,6 +35,7 @@
     'world-engine-store.js',
     'world-engine-core.js',
     'world-engine-api.js',
+    'world-engine-bridge.js',
     'world-engine-worldbook.js',
     'world-engine-chatcache.js',
     'world-engine-inject-inspector.js'
@@ -43,6 +44,7 @@
     WORLD_ENGINE_STORE: ['hydrate', 'getItem', 'setItem'],
     WORLD_ENGINE_CORE: ['getChatId', 'loadState'],
     WORLD_ENGINE_API: ['callApi'],
+    WORLD_ENGINE_BRIDGE: ['buildBridgeSection', 'buildHistorySection'],
     WORLD_ENGINE_WORLDBOOK: ['buildPromptSection'],
     WORLD_ENGINE_CHATCACHE: ['init'],
     WORLD_ENGINE_INJECT_INSPECTOR: ['init']
@@ -517,10 +519,21 @@
         return Math.max(1, Math.min(since, limit));
       }
 
+      // 上下文读取模式（参考 choice 的 context_mode）：
+      //   'rounds' = 按轮：未隐藏楼层里取最后 readRounds*2 条（隐藏楼层不占轮数槽位）
+      //   'visible' = 可见层：全部未隐藏楼层（忽略轮数限制）
+      // 「首楼为 AI 开场白」裁剪作用于【全聊天】的第 0 层（先裁再取窗口）——
+      // 不能对窗口再切一次，否则窗口内最旧的一条会被凭空丢弃（v3.3.0 回归：窗口边缘那轮消失）。
       function buildDialogueText(chat, readRounds, settings) {
-        const start = Math.max(settings.firstLayerIsAiOpening !== false ? 1 : 0, chat.length - readRounds * 2);
-        return chat.slice(start)
-          .map(m => (m.is_user ? '用户' : 'AI') + '：' + core.filterDialogue((m.mes || '').trim(), settings))
+        const all = (chat || []);
+        const withoutOpening = settings.firstLayerIsAiOpening !== false ? all.slice(1) : all;
+        const visible = withoutOpening.filter(m => !m.is_system);
+        const mode = settings.contextMode === 'visible' ? 'visible' : 'rounds';
+        const msgs = mode === 'visible' ? visible : visible.slice(-Math.max(1, readRounds) * 2);
+        // depth 相对本次读取窗口的末尾（与 choice 构建历史同款）：开启「走酒馆正则」时供
+        // minDepth/maxDepth 脚本判定楼层深浅，窗口内最后一条 depth=0。
+        return msgs
+          .map((m, idx) => (m.is_user ? '用户' : 'AI') + '：' + core.filterDialogue((m.mes || '').trim(), settings, null, { isUser: !!m.is_user, depth: msgs.length - 1 - idx }))
           .filter(line => line.length > 3)
           .join('\n');
       }
@@ -540,16 +553,14 @@
           if (ui && ui.setEvolvingUI) ui.setEvolvingUI(true, displayScope);
           if (ui && ui.refresh) ui.refresh(true);
 
-          // 取对话喂后台；时间模式由调用方传入读取轮数，按轮模式用 a（夹紧到 X）。start 做负数保护
+          // 取对话喂后台；时间模式由调用方传入读取轮数，按轮模式用 a（不再受 X 限制，
+          // 超出聊天长度时读全部）；可见层模式在 buildDialogueText 内忽略轮数读全部未隐藏楼层。
           const settings = api.getSettings(true);
           let readRounds;
           if (readRoundsOverride != null) {
             readRounds = Math.max(1, parseInt(readRoundsOverride) || 1);
           } else {
             readRounds = Math.max(1, parseInt(settings.evolveReadRounds) || 1);
-            if (settings.evolveMode === 'auto') {
-              readRounds = Math.min(Math.max(1, parseInt(settings.evolveEveryX) || 1), readRounds);
-            }
           }
           const dialogueText = buildDialogueText(chat, readRounds, settings);
 
@@ -753,6 +764,50 @@
         applyInjectionForCurrentRound({ isReroll });
       }
 
+      // 柏宝书时间标签解析（按时间模式「自动回填」用）：从最新 AI 楼的 <bbs_end>…</bbs_end>
+      // 提取 YYYY/M/D（含时刻），按 年×360 + 月×30 + 日 换算总天数（与按时间设置默认乘数口径一致）。
+      // 读原始 mes——柏宝书的隐藏正则只作用于显示层，标签仍在原文里。从聊天末尾往前扫，
+      // 一楼多标签取最后一个（与 parseStoryDay「取最后一个匹配」语义一致：剧情结束时刻）。
+      // 标签是插件生成的机器格式，日期用阿拉伯数字；正文里的多种日期写法走 parseLatestStoryDay。
+      // 找不到标签或日期字段时返回 null。
+      function parseBaiBaiEndDay(chat) {
+        const tagRe = /<bbs_end\s*>([\s\S]*?)<\/bbs_end\s*>/i;
+        const dateRe = /(\d{4})\s*[/\-年]\s*(\d{1,2})\s*[/\-月]\s*(\d{1,2})/;
+        for (let i = (Array.isArray(chat) ? chat.length : 0) - 1; i >= 0; i--) {
+          const m = chat[i];
+          if (!m || m.is_user || m.is_system) continue;
+          const tagHit = String(m.mes || '').match(tagRe);
+          if (!tagHit) continue;
+          const dm = String(tagHit[1] || '').match(dateRe);
+          if (!dm) continue;
+          const year = parseInt(dm[1], 10);
+          const month = parseInt(dm[2], 10);
+          const day = parseInt(dm[3], 10);
+          if (!Number.isFinite(year) || !Number.isFinite(month) || !Number.isFinite(day)) continue;
+          // 时刻（结束时刻语义）：取日期之后的第一处「HH:MM / 下午 / 深夜」类线索，仅用于展示
+          const rest = String(tagHit[1] || '').slice(dm.index + dm[0].length);
+          const clockM = rest.match(/(\d{1,2}\s*[:：]\s*\d{2}|凌晨|清晨|早晨|上午|中午|下午|傍晚|黄昏|晚上|深夜|午夜|子夜|黎明|拂晓)/);
+          return { year, month, day, total: year * 360 + month * 30 + day, floor: i, source: 'baibai-tag', clock: clockM ? clockM[1].replace(/\s+/g, '') : null };
+        }
+        return null;
+      }
+
+      // 通用日期提取（回退路径，不依赖任何插件）：从最新 AI 楼正文提取「当前剧情时间」的
+      // 年/月/日，按 年×360 + 月×30 + 日 换算总天数。认的格式与「正文多日期」选取规则
+      // （当下线索加分、回溯线索扣分、同分取靠后）见 core.parseStoryDate。
+      // 有柏宝书标签时优先走 parseBaiBaiEndDay（标签语义 = 剧情结束时刻，比正文日期更权威）。
+      function parseLatestStoryDay(chat) {
+        const tagged = parseBaiBaiEndDay(chat);
+        if (tagged) return tagged;
+        for (let i = (Array.isArray(chat) ? chat.length : 0) - 1; i >= 0; i--) {
+          const m = chat[i];
+          if (!m || m.is_user || m.is_system) continue;
+          const hit = core.parseStoryDate(m.mes);
+          if (hit) return Object.assign({}, hit, { floor: i });
+        }
+        return null;
+      }
+
       // ========== 事件绑定 ==========
       const ctx = SillyTavern.getContext();
       if (ctx && ctx.eventSource) {
@@ -770,7 +825,7 @@
       // 初始化时立即按对话层数选择注入状态
       applyInjectionForCurrentRound();
       // 暴露按对话层数选择的注入入口供手动调用
-      window.WORLD_ENGINE = { applyInjection: applyInjectionForCurrentRound, manualEvolve, manualTimeEvolve, manualMemoryLink };
+      window.WORLD_ENGINE = { applyInjection: applyInjectionForCurrentRound, manualEvolve, manualTimeEvolve, manualMemoryLink, parseBaiBaiEndDay, parseLatestStoryDay };
 
       // ========== 添加面板入口按钮到酒馆输入栏 ==========
       // 已移至 world-engine-ui.js 的 buildInputButton()

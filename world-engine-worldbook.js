@@ -22,6 +22,62 @@ window.WORLD_ENGINE_WORLDBOOK = (function() {
 
   // 触发模式的合法 override 值（'auto' 为默认、不落盘）：强制常驻 / 强制关键词 / 关闭
   const OVERRIDE_VALUES = ['const', 'key', 'off'];
+
+  // ========== 全局排除世界书 ==========
+  // 参考 choice 的 global_excluded_books：书名列表，跨聊天全局生效（全局键，不按聊天隔离、
+  // 不进聊天缓存镜像）。排除优先于条目勾选：被排除书的条目一律不注入；条目勾选记录保留，
+  // 移除排除后自动恢复参与。对世界推演与记忆推演两个消费点同时生效。
+  const GLOBAL_EXCLUDED_KEY = 'world_engine_worldbook_global_excluded';
+
+  function readGlobalExcluded() {
+    try {
+      const data = JSON.parse(window.WORLD_ENGINE_STORE.getItem(GLOBAL_EXCLUDED_KEY) || '[]');
+      if (!Array.isArray(data)) return [];
+      return [...new Set(data.filter(name => typeof name === 'string' && name))];
+    } catch (e) {
+      return [];
+    }
+  }
+
+  function getGlobalExcludedBooks() {
+    return readGlobalExcluded();
+  }
+
+  function isBookGloballyExcluded(world) {
+    return readGlobalExcluded().includes(world);
+  }
+
+  function addGlobalExcludedBook(world) {
+    if (typeof world !== 'string' || !world) return;
+    const list = readGlobalExcluded();
+    if (!list.includes(world)) {
+      window.WORLD_ENGINE_STORE.setItem(GLOBAL_EXCLUDED_KEY, JSON.stringify([...list, world]));
+    }
+  }
+
+  function removeGlobalExcludedBook(world) {
+    const list = readGlobalExcluded();
+    if (list.includes(world)) {
+      window.WORLD_ENGINE_STORE.setItem(GLOBAL_EXCLUDED_KEY, JSON.stringify(list.filter(name => name !== world)));
+    }
+  }
+
+  // 酒馆世界书库存全集（供全局排除的可添加列表，含未激活的书）。
+  // world_names 是 world-info.js 的动态导出，惰性取实时值；读取失败回退为当前聊天条目里出现过的书名。
+  async function getAllWorldBookNames() {
+    try {
+      const module = await getWorldInfoModule();
+      const names = Array.isArray(module.world_names) ? module.world_names.filter(n => typeof n === 'string' && n) : [];
+      if (names.length) return names;
+    } catch (e) { /* 回退 */ }
+    try {
+      const entries = await loadCurrentEntries();
+      return [...new Set(entries.map(entry => entry.world))];
+    } catch (e) {
+      return [];
+    }
+  }
+
   function sanitizeOverrides(obj) {
     const out = {};
     if (obj && typeof obj === 'object') {
@@ -140,11 +196,53 @@ window.WORLD_ENGINE_WORLDBOOK = (function() {
     return worldInfoModulePromise;
   }
 
+  // ========== 世界书条目宏展开 + EJS 渲染 ==========
+  // 参考 choice 的 ejs-bridge.renderWorldInfoContent：① substituteParams 展开 {{user}} 等酒馆
+  // 原生宏；② 含 <% 且装了提示词模板插件（ST-Prompt-Template，公共 API 挂在 globalThis.EjsTemplate
+  // 上）时执行 EJS；未装插件则止步于展宏（<% %> 原样保留）。单条渲染失败退回上一步文本，
+  // 不影响其他条目与整体注入。脚本模块（非 ESM），substituteParams 经动态 import 取实时导出。
+  let scriptModulePromise = null;
+  async function getScriptModule() {
+    if (!scriptModulePromise) {
+      scriptModulePromise = import('/script.js').catch(error => {
+        scriptModulePromise = null;
+        throw error;
+      });
+    }
+    return scriptModulePromise;
+  }
+
+  async function renderEntryContent(content) {
+    let text = String(content || '');
+    if (!text) return text;
+    // ① 展宏（失败保留原文）
+    try {
+      const script = await getScriptModule();
+      if (typeof script.substituteParams === 'function') {
+        text = script.substituteParams(text) || text;
+      }
+    } catch (e) { /* 保留原文 */ }
+    // ② 无 EJS 标签则到此为止（多数条目是纯文本）
+    if (!text.includes('<%')) return text;
+    // ③ 未装提示词模板插件则止步于展宏
+    const ejs = globalThis.EjsTemplate;
+    if (!ejs || typeof ejs.prepareContext !== 'function' || typeof ejs.evalTemplate !== 'function') return text;
+    try {
+      const env = await ejs.prepareContext();
+      const out = await ejs.evalTemplate(text, env);
+      if (typeof out === 'string') text = out;
+    } catch (e) {
+      console.warn('[世界引擎] 世界书 EJS 渲染失败（退回展宏文本）:', e);
+    }
+    return text;
+  }
+
   async function loadCurrentEntries() {
     const module = await getWorldInfoModule();
     if (typeof module.getSortedEntries !== 'function') {
       throw new Error('当前 SillyTavern 版本不支持读取世界书条目');
     }
+    const excludedBooks = new Set(readGlobalExcluded());
     const entries = await module.getSortedEntries();
     return (Array.isArray(entries) ? entries : [])
       .filter(entry => entry && entry.uid !== undefined && String(entry.content || '').trim())
@@ -157,6 +255,8 @@ window.WORLD_ENGINE_WORLDBOOK = (function() {
         title: getEntryTitle(entry),
         content: String(entry.content || '').trim(),
         disabled: entry.disable === true || entry.enabled === false,
+        // 所属世界书被全局排除（🚫）：展示与勾选交互保留，注入时整体跳过
+        globallyExcluded: excludedBooks.has(entry.world || '未知世界书'),
         // —— 原生激活配置（蓝绿灯触发用，跟随酒馆世界书自身设置）——
         constant: entry.constant === true,                  // 🔵 常驻
         vectorized: entry.vectorized === true,              // 🔗 向量（本扩展不做向量召回，按非关键词处理）
@@ -182,6 +282,18 @@ window.WORLD_ENGINE_WORLDBOOK = (function() {
     const a = window.WORLD_ENGINE_API;
     const s = a && a.getSettings ? a.getSettings() : {};
     return s.worldbookTrigger === true;
+  }
+
+  // 世界书条目 EJS 渲染开关（默认关闭=原文注入）。世界/记忆两消费点共用一个设置项
+  // （世界引擎 worldbookEjsRender）；记忆引擎面板无独立开关，跟随世界引擎。
+  function isEjsRenderEnabled(scope) {
+    if (normalizeScope(scope) === 'memory') {
+      const ms = window.MEMORY_ENGINE_SETTINGS?.getSettings();
+      return ms?.worldbookEjsRender === true;
+    }
+    const a = window.WORLD_ENGINE_API;
+    const s = a && a.getSettings ? a.getSettings() : {};
+    return s.worldbookEjsRender === true;
   }
 
   // 形如 /pattern/flags 的关键词按正则处理（与酒馆一致）
@@ -250,7 +362,9 @@ window.WORLD_ENGINE_WORLDBOOK = (function() {
 
     try {
       const entries = await loadCurrentEntries();
-      const pool = entries.filter(entry => selectedIds.has(entry.id) && !entry.disabled);
+      const pool = entries.filter(entry => selectedIds.has(entry.id) && !entry.disabled)
+        // 全局排除优先于勾选：被排除书的条目一律不注入（勾选记录保留，移除排除后自动恢复）
+        .filter(entry => !entry.globallyExcluded);
       if (!pool.length) return '';
 
       let selectedEntries;
@@ -272,7 +386,16 @@ window.WORLD_ENGINE_WORLDBOOK = (function() {
 
       if (!selectedEntries.length) return '';
 
-      const content = selectedEntries.map(entry =>
+      // EJS 渲染开关（默认关闭=条目原文注入，维持旧行为）：展开 {{user}} 等宏并执行 <% %> 模板
+      const ejsOn = isEjsRenderEnabled(normalizedScope);
+      const renderedEntries = ejsOn
+        ? await Promise.all(selectedEntries.map(async entry => ({
+            ...entry,
+            content: await renderEntryContent(entry.content)
+          })))
+        : selectedEntries;
+
+      const content = renderedEntries.map(entry =>
         `【${entry.world} / ${entry.title}】\n${entry.content}`
       ).join('\n\n');
 
@@ -300,8 +423,15 @@ ${content}`;
     loadCurrentEntries,
     buildPromptSection,
     triggerEnabled,
+    isEjsRenderEnabled,
+    renderEntryContent,
     isEntryActive,
     activationOf,
-    matchKey
+    matchKey,
+    getGlobalExcludedBooks,
+    isBookGloballyExcluded,
+    addGlobalExcludedBook,
+    removeGlobalExcludedBook,
+    getAllWorldBookNames
   };
 })();

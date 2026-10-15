@@ -1,7 +1,7 @@
 // memory-engine-settings.js — 记忆引擎独立设置（只复用 API/调度等实现，不共享配置值）
 window.MEMORY_ENGINE_SETTINGS = (function() {
   const STORAGE_KEY = 'memory_engine_settings';
-  const VERSION = '1.1.2';
+  const VERSION = '1.2.0';
   const DEFAULTS = Object.freeze({
     apiUrl: '',
     apiKey: '',
@@ -33,9 +33,14 @@ window.MEMORY_ENGINE_SETTINGS = (function() {
     apiAutoRetries: 0,
     nameBlacklist: '',
     filterRegex: '',
+    filterUseStRegex: false,
     tonePrompt: '',
     worldbookEnabled: false,
     worldbookTrigger: false,
+    worldbookEjsRender: false,
+    // 用户人设参照：把酒馆「用户设定」里的 persona 描述只读喂给记忆提取 prompt（默认关闭）。
+    // 酒馆里把人设注入位置设为「不注入」时，即使本开关打开也不注入。
+    personaEnabled: false,
     syncToChat: false,
     autoBackup: false,
     backfillBatchSize: 5,

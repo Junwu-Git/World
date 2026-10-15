@@ -95,11 +95,65 @@ window.WORLD_ENGINE_CORE = (function() {
     return '用户';
   }
 
-  /** UI 渲染：替换文本中的 {{user}} 为当前角色名 */
+  // 展开酒馆用户宏：{{user}}（花括号宏）与 <user>/<USER>（酒馆遗留宏，见 macros.js
+  // evaluateMacros 的 preEnvMacros）都替换为当前扮演角色名。引擎自建的 API 请求不走
+  // 酒馆 substituteParams，这些宏会原样到达模型，故 UI 展示与请求发出前都过这里。
   function renderUserName(text) {
     if (!text || typeof text !== 'string') return text;
     const name = getUserName();
-    return text.replace(/\{\{user\}\}/g, name);
+    return text.replace(/\{\{user\}\}/gi, name).replace(/<user>/gi, name);
+  }
+
+  // ========== 用户人设（酒馆「用户设定」里的 persona 描述）==========
+  // getContext() 不暴露人设描述，只能动态 import 酒馆脚本模块取实时值（与
+  // world-engine-worldbook.js 取 substituteParams 同款路子）。power_user.persona_description
+  // 是酒馆核心自己用于注入的单一字段，切换/编辑 persona 时由核心同步，读它即当前人设。
+  // persona_description_position === NONE(9) 表示用户在酒馆里主动关闭了人设注入，
+  // 此时即使本扩展开关打开也不注入，尊重用户选择。
+  let powerUserModulePromise = null;
+  function getPowerUserModule() {
+    if (!powerUserModulePromise) {
+      powerUserModulePromise = import('/scripts/power-user.js').catch(error => {
+        powerUserModulePromise = null;
+        throw error;
+      });
+    }
+    return powerUserModulePromise;
+  }
+
+  const PERSONA_MAX_CHARS = 4000; // 人设描述注入上限，防 prompt 膨胀（与外部数据源桥同思路）
+
+  // 返回 { description, position }；读不到/未设置返回 null。任何异常都吞掉返回 null。
+  async function getPersonaDescription() {
+    try {
+      const mod = await getPowerUserModule();
+      const powerUser = mod?.power_user;
+      if (!powerUser) return null;
+      const description = String(powerUser.persona_description || '').trim();
+      const position = Number(powerUser.persona_description_position);
+      return { description, position: Number.isFinite(position) ? position : 0 };
+    } catch (e) {
+      return null;
+    }
+  }
+
+  // 纯文本构建：人设描述 → prompt 段。空描述返回 ''；超长截断（截断标记随段发出）。
+  function buildPersonaSectionText(description) {
+    const text = String(description || '').trim();
+    if (!text) return '';
+    const body = text.length > PERSONA_MAX_CHARS
+      ? text.slice(0, PERSONA_MAX_CHARS) + '…（已截断）'
+      : text;
+    return `========== 用户人设（{{user}} 的角色设定）==========\n${body}\n\n（以上是幕后世界中以「{{user}}」身份参与剧情的人物设定。推演涉及{{user}}的地位、权力、能力、人际网络与行为倾向时以本设定为准；设定未覆盖的细节保持中性，不得凭空夸大或弱化{{user}}。）`;
+  }
+
+  // 构建「用户人设」prompt 段。enabled=false、人称为空、position=NONE 或读取失败时返回 ''。
+  async function buildPersonaSection(enabled) {
+    if (enabled !== true) return '';
+    const persona = await getPersonaDescription();
+    if (!persona || !persona.description) return '';
+    if (persona.position === 9) return ''; // NONE：用户在酒馆关闭了人设注入
+    return buildPersonaSectionText(persona.description);
   }
 
   function getChatId() {
@@ -518,14 +572,66 @@ window.WORLD_ENGINE_CORE = (function() {
     return out;
   }
 
+  // 酒馆正则（ST 原生「正则」面板脚本）模块懒加载。
+  // 动态 import 在经典脚本里按文档基准 URL 解析，故不用相对写法，改用本文件自身 script 标签的
+  // src 拼绝对 URL——script.js 已静态 import 同一模块，浏览器模块缓存命中，加载后几乎立即就绪，
+  // 而过滤都发生在推演/生成时（晚于扩展加载），同步路径拿到即用。取不到或失败 → null，静默跳过。
+  let _stRegexModule = null;
+  (function preloadStRegex() {
+    try {
+      const scripts = document.getElementsByTagName('script');
+      for (let i = 0; i < scripts.length; i++) {
+        const src = scripts[i].src;
+        if (src && src.indexOf('world-engine-core.js') >= 0) {
+          const url = new URL('../../regex/engine.js', src).href;
+          Promise.resolve(import(url)).then(mod => { _stRegexModule = mod; }).catch(() => {});
+          return;
+        }
+      }
+    } catch (e) { /* 老浏览器无动态 import 或路径异常 → 静默降级 */ }
+  })();
+
+  // 把一段文本按酒馆主生成同款方式过一遍正则脚本（对齐 script.js coreChat）：
+  //   placement = 用户输入 / AI 输出；isPrompt=true 时仅勾了「Alter Outgoing Prompt」(promptOnly)
+  //   的脚本生效（与主生成一致，显示美化类 markdownOnly 脚本不参与）；depth = 距末尾层数，
+  //   供 minDepth/maxDepth 脚本使用。任何异常原样返回，绝不打断推演。
+  let _stRegexWarned = false;
+  function applyStRegex(text, isUser, depth) {
+    const mod = _stRegexModule;
+    if (!mod || typeof mod.getRegexedString !== 'function') {
+      // 仅提示一次，避免逐楼层刷屏
+      if (!_stRegexWarned) {
+        _stRegexWarned = true;
+        console.warn('[世界引擎] 酒馆正则模块未就绪/不可用，本次过滤跳过酒馆正则（刷新页面可重试加载）');
+      }
+      return text;
+    }
+    try {
+      const placement = isUser ? mod.regex_placement.USER_INPUT : mod.regex_placement.AI_OUTPUT;
+      const opts = { isPrompt: true };
+      if (Number.isFinite(depth)) opts.depth = depth;
+      return mod.getRegexedString(String(text == null ? '' : text), placement, opts);
+    } catch (e) { return text; }
+  }
+
+  // 酒馆正则模块是否已就绪（供 UI 测试按钮判断：未就绪时过酒馆正则会原样返回）。
+  function stRegexReady() {
+    return !!(_stRegexModule && typeof _stRegexModule.getRegexedString === 'function');
+  }
+
   // 过滤对话文本。第三参 onError(lineNo, rawLine, reason) 可选——传入则在单条非法时回调（保存/测试用），
   // 不传则静默（生产推演路径，绝不打断）。三处生产调用点均不传第三参，行为与旧版一致。
-  function filterDialogue(text, settings, onError) {
+  // 第四参 opts = { isUser, depth } 可选——仅 settings.filterUseStRegex 为 true 时用于先过酒馆正则：
+  //   isUser —— 该条消息是用户输入还是 AI 输出（决定 placement）；depth —— 距末尾层数（min/maxDepth 用）。
+  function filterDialogue(text, settings, onError, opts) {
     if (!text) return text || '';
-    const raw = (settings && settings.evolveFilterRegex) || '';
-    if (!raw.trim()) return text;
-    const v = validateFilterRegex(raw);
     let out = text;
+    if (settings && settings.filterUseStRegex === true) {
+      out = applyStRegex(out, opts && opts.isUser, opts && opts.depth);
+    }
+    const raw = (settings && settings.evolveFilterRegex) || '';
+    if (!raw.trim()) return out;
+    const v = validateFilterRegex(raw);
     for (let i = 0; i < v.entries.length; i++) {
       const e = v.entries[i];
       // validateFilterRegex 已试编译过，这里必然成功；保留 try 仅为防御性兜底
@@ -626,6 +732,135 @@ window.WORLD_ENGINE_CORE = (function() {
       total += cnToNum(last[k + 1]) * mul;
     }
     return total;
+  }
+
+  // ========== 通用故事日期提取（「从正文自动回填时间」一键引导用） ==========
+  // 与 parseStoryDay 分工：parseStoryDay 是用户配好 6 框正则后每轮的精确解析（乘数可自定义）；
+  // 本函数是零配置的快速路径，面向「一键引导」，认多种常见日期写法——
+  //   2049/10/3、2049-10-03、2049.10.3、2049年10月3日、2049年10月3号、
+  //   2049年十月三日、二〇二五年十月三日（中文数字年月日）、全角字符、
+  //   分隔符混用（2049年10/3）；以及只有月日的「10月3日」——年份继承同楼更靠前的
+  //   最近一个完整日期，继承不到就放弃，绝不猜年份。
+  // 正文多日期（回忆、履历、倒叙极常见）不能简单取最后一个：按「当前时间」语义打分——
+  //   日期前 14 字内有 现在/今天/此时/如今 等当下线索 → 大幅加分；
+  //   有 那年/三年前/曾经/回忆 等回溯线索，或 明天/后天/计划 等未来线索 → 扣分（有当下线索时不扣）；
+  //   日期后 14 字内跟时刻（23:30/下午/深夜）→ 加分（剧情结束时刻语义）；
+  //   位置渐变加分（越靠后越可能是当前时间，最多 +30）；仅月日候选再扣一点。
+  //   同分取更靠后的（保持「取最后一个」的兜底方向）。
+  // 思维链/HTML 注释先整块删掉（think 极爱复述旧日期）。全角归一化逐字符 1:1 替换，不改变长度。
+  // 返回 { year, month, day, total, source, clock, candidateCount }；解析不到返回 null。
+  //   source: 'text'（完整日期） | 'text-md'（仅月日，年份继承）
+  const CN_DIGITS = { 零: 0, 〇: 0, 一: 1, 二: 2, 两: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9 };
+  // 逐位中文数字（二〇二五 → 2025）：年份专用；月/日是位值记法（十月=10），走 cnToNum
+  function cnDigitsToNum(s) {
+    let out = '';
+    for (const ch of String(s)) {
+      if (CN_DIGITS[ch] == null) return null;
+      out += String(CN_DIGITS[ch]);
+    }
+    return out ? parseInt(out, 10) : null;
+  }
+  // 月/日分量：'3' | '三' | '十' | '十一' | '二十' | '初九' → 数值；不合法返回 null
+  function datePartToNum(s) {
+    s = String(s);
+    if (/^\d{1,2}$/.test(s)) return parseInt(s, 10);
+    if (/^初[一二三四五六七八九]$/.test(s)) return CN_DIGITS[s[1]];
+    if (/^[零〇一二两三四五六七八九十]{1,3}$/.test(s)) {
+      const n = cnToNum(s);
+      return n > 0 ? n : null;
+    }
+    return null;
+  }
+  // 全角数字/分隔符 → 半角（1:1 替换，长度不变，候选下标仍对回原文）。
+  // 注意只归一「．」不碰「。」——中文句号是正文里最常见的前置字符，归一成 '.' 会被
+  // 「仅月日」正则的前置守卫误杀（。10月3日 → .10月3日 → 被 . 挡住）。
+  function normalizeDateChars(s) {
+    return String(s || '')
+      .replace(/[０-９]/g, c => String.fromCharCode(c.charCodeAt(0) - 0xFEE0))
+      .replace(/[／]/g, '/')
+      .replace(/[－ー—–]/g, '-')
+      .replace(/[．]/g, '.')
+      .replace(/[：]/g, ':');
+  }
+  // 时刻线索：日期后跟「23:30 / 下午 / 深夜」等（剧情结束时刻语义）
+  const CLOCK_HINT_RE = /(\d{1,2}\s*[:：]\s*\d{2}|凌晨|清晨|早晨|上午|中午|下午|傍晚|黄昏|晚上|深夜|午夜|子夜|黎明|拂晓)/;
+  function parseStoryDate(rawText) {
+    if (!rawText) return null;
+    const text = normalizeDateChars(rawText)
+      .replace(/<think(?:ing)?\b[\s\S]*?<\/think(?:ing)?>/gi, ' ')
+      .replace(/<!--[\s\S]*?-->/g, ' ');
+    if (!text.trim()) return null;
+
+    const NUM_PART = '(?:\\d{1,2}|[一二两三四五六七八九十]{1,3}|初[一二三四五六七八九])';
+    const SEP = '[/\\-.·]';
+    // 完整日期：四位阿拉伯年或四位逐位中文年（二〇二五）；月/日可中文；「日/号」可省
+    const fullRe = new RegExp(
+      '(?<![\\d\\w])(\\d{4}|[零〇一二两三四五六七八九]{4})' +
+      '\\s*(?:' + SEP + '|年)\\s*(' + NUM_PART + ')' +
+      '\\s*(?:' + SEP + '|月)\\s*(' + NUM_PART + ')\\s*(?:日|号)?(?!\\d)', 'g');
+    const candidates = [];
+    const pushFull = (m) => {
+      const year = /^\d{4}$/.test(m[1]) ? parseInt(m[1], 10) : cnDigitsToNum(m[1]);
+      const month = datePartToNum(m[2]);
+      const day = datePartToNum(m[3]);
+      if (year == null || month == null || day == null) return;
+      if (year < 1000 || month < 1 || month > 12 || day < 1 || day > 31) return;
+      candidates.push({ year, month, day, start: m.index, end: m.index + m[0].length, inheritedYear: false });
+    };
+    let m;
+    while ((m = fullRe.exec(text)) !== null) {
+      if (m.index === fullRe.lastIndex) fullRe.lastIndex++;
+      pushFull(m);
+    }
+    // 只有月日（10月3日）：先把完整日期等长挖空（保下标），再扫残留文本。
+    // 前置守卫只排除数字/中文数字/年——挡的是「2049年10月3日」这类完整日期的月日片段
+    // （正常情况下完整日期已被挖空，这里是双保险）；分隔符不排除，否则「——10月3日」
+    // 「，10月3日」等正常行文会被误杀。
+    let masked = text;
+    for (const c of candidates) masked = masked.slice(0, c.start) + '\u25A0'.repeat(c.end - c.start) + masked.slice(c.end);
+    const mdRe = new RegExp(
+      '(?<![\\d零〇一二两三四五六七八九年])(' + NUM_PART + ')\\s*月\\s*(' + NUM_PART + ')\\s*[日号](?!\\d)', 'g');
+    const mdHits = [];
+    while ((m = mdRe.exec(masked)) !== null) {
+      if (m.index === mdRe.lastIndex) mdRe.lastIndex++;
+      mdHits.push({ month: m[1], day: m[2], start: m.index, end: m.index + m[0].length });
+    }
+    for (const h of mdHits) {
+      let year = null;
+      for (const c of candidates) if (c.start < h.start) year = c.year;   // 同楼最近一个更早的完整日期
+      if (year == null) continue;
+      const month = datePartToNum(h.month);
+      const day = datePartToNum(h.day);
+      if (month == null || day == null || month < 1 || month > 12 || day < 1 || day > 31) continue;
+      candidates.push({ year, month, day, start: h.start, end: h.end, inheritedYear: true });
+    }
+    if (!candidates.length) return null;
+
+    const CUE_NOW = /(?:现在|此时|此刻|今天|今日|当晚|当天|如今|现今|目前|时至|正值|乃是|转眼|开篇|伊始|起始|故事开始|现在是|日期是|时间是|就在)/;
+    const CUE_PAST = /(?:那年|当年|曾经|从前|早年|多年前|年前|回忆|回顾|追溯|昔日|过往|过去|那时|很久以前|早在|直到那年)/;
+    const CUE_FUTURE = /(?:明天|明日|次日|翌日|后天|大后天|即将|将于|计划|预计|尚未)/;
+    let best = null;
+    for (const c of candidates) {
+      const before = text.slice(Math.max(0, c.start - 14), c.start);
+      const after = text.slice(c.end, c.end + 14);
+      let score = Math.round((c.start / Math.max(1, text.length)) * 30);   // 越靠后越可能是当前时间
+      if (CUE_NOW.test(before)) score += 120;
+      else if (CUE_PAST.test(before) || CUE_FUTURE.test(before)) score -= 80;
+      if (CLOCK_HINT_RE.test(after)) score += 30;
+      if (c.inheritedYear) score -= 10;
+      if (!best || score > best.score || (score === best.score && c.start > best.c.start)) best = { c, score };
+    }
+    const b = best.c;
+    const clockM = text.slice(b.end, b.end + 14).match(CLOCK_HINT_RE);
+    return {
+      year: b.year,
+      month: b.month,
+      day: b.day,
+      total: b.year * 360 + b.month * 30 + b.day,
+      source: b.inheritedYear ? 'text-md' : 'text',
+      clock: clockM ? clockM[1].replace(/\s+/g, '') : null,
+      candidateCount: candidates.length
+    };
   }
 
   function ensureEventFields(ev) {
@@ -813,10 +1048,11 @@ window.WORLD_ENGINE_CORE = (function() {
     ENTITY_ID_PREFIXES, entityIdNumber, nextEntityId, ensureEntityIds, findEntityIndex, assignEntityId,
     inheritLegacyIds,
     ensureEventFields, getUserName, renderUserName,
+    getPersonaDescription, buildPersonaSection, buildPersonaSectionText,
     saveCheckpoint, restoreCheckpoint, clearCheckpoint, getAnchorLayer, setAnchorLayer,
     getChatLayer, getChatFingerprint, saveFingerprint, loadFingerprint, isNewRound,
     getCleanExport, importState,
-    cnToNum, parseStoryDay, getLastStoryDay, setLastStoryDay, filterDialogue,
-    validateFilterRegex
+    cnToNum, parseStoryDay, parseStoryDate, getLastStoryDay, setLastStoryDay, filterDialogue,
+    validateFilterRegex, applyStRegex, stRegexReady
   };
 })();

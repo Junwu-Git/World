@@ -1,10 +1,10 @@
 // 世界→记忆联动与指数注入离线测试：node docs/memory-world-link-test.js
-const assert = require('assert');
-const fs = require('fs');
-const path = require('path');
-const vm = require('vm');
+import assert from 'node:assert';
+import path from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
-const root = path.resolve(__dirname, '..');
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const importModule = file => import(pathToFileURL(path.join(root, file)));
 const store = new Map();
 let version = 'A';
 const chat = [{ is_user: false, name: '角色', mes: '测试场景' }];
@@ -18,8 +18,10 @@ const memorySettings = {
   filterRegex: ''
 };
 
-const sandbox = {
-  window: null,
+// 各记忆模块按 window 全局互相引用，这里以 Node global 充当该 window（测试直接读写同一对象）。
+const sandbox = global;
+sandbox.window = sandbox;
+Object.assign(sandbox, {
   console,
   setTimeout,
   clearTimeout,
@@ -53,14 +55,13 @@ const sandbox = {
       });
     }
   }
-};
-sandbox.window = sandbox;
+});
 
 for (const file of [
   'memory-engine-data.js', 'memory-engine-prompt.js', 'memory-engine-small-summary-prompt.js',
   'memory-engine-big-summary-prompt.js', 'memory-engine.js'
 ]) {
-  vm.runInNewContext(fs.readFileSync(path.join(root, file), 'utf8'), sandbox, { filename: file });
+  await importModule(file);
 }
 
 (async () => {

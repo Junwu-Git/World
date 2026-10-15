@@ -33,11 +33,18 @@ window.WORLD_ENGINE_API = (function() {
       injectAllLevels: false,
       // 世界 API 成功后，把本轮世界信息联动到记忆引擎。
       memoryLinkEnabled: false,
+      // 外部数据源桥（单选）：把一个第三方记忆插件的数据只读喂给推演 prompt 作为世界事实参照。
+      // 'off'=不接入（默认）| 'baibaibook'=柏宝书 | 'shujuku'=SP·数据库
+      bridgeSource: 'off',
       evolveMode: 'auto',
       // 酒馆缓存：把按聊天隔离的存档镜像进 chat_metadata，实现跨设备同步与防丢失存档（默认关闭）
       syncToChat: false,   // 实时同步：工作区状态持续镜像进聊天，换设备打开同一聊天即可续上
       autoBackup: false,   // 滚动自动备份：每当轮次推进，自动存一条到聊天（保留最近几条）
       worldbookTrigger: false, // 世界书蓝绿灯触发：🔵常驻恒注入 / 🟢关键词命中才注入（默认关闭=全部已选注入）
+      worldbookEjsRender: false, // 世界书条目 EJS 渲染：展开 {{宏}} 并执行 <% %> 模板（默认关闭=原文注入）
+      // 用户人设参照：把酒馆「用户设定」里的 persona 描述只读喂给推演 prompt（默认关闭）。
+      // 酒馆里把人设注入位置设为「不注入」时，即使本开关打开也不注入。
+      personaEnabled: false,
       // 批量重填世界推演：从第 1 个 AI 楼层分批推到指定楼层（清空重来）
       backfillBatchSize: 5,    // 每批 AI 楼层数（每多少层调一次推演）
       backfillRetries: 2,      // 每批独立重试次数（推演失败时重试上限）
@@ -45,6 +52,8 @@ window.WORLD_ENGINE_API = (function() {
       evolveEveryX: 1,
       evolveReadRounds: 1,
       manualReadRounds: 1,
+      // 推演上下文读取模式：'rounds'=按轮（读最近 a 轮，默认，旧行为）；'visible'=可见层（全部未隐藏楼层）
+      contextMode: 'rounds',
       evolveFilterRegex: '',
       tonePrompt: '',
       // 按时间推演模式
@@ -276,9 +285,14 @@ window.WORLD_ENGINE_API = (function() {
     // 兼容旧设置：曾保存为 4096 的输出上限自动提升到 65000。
     const selectedMaxTokens = configuredMaxTokens === 4096 ? 65000 : configuredMaxTokens;
 
+    // 引擎自建请求不过酒馆 substituteParams：prompt 里的 {{user}}、<user> 会原样到达模型。
+    // 发出前统一展开为酒馆设定的 user 名称（世界引擎/记忆引擎共用此出口，幂等）。
+    const renderUserName = window.WORLD_ENGINE_CORE && window.WORLD_ENGINE_CORE.renderUserName;
+    const finalPrompt = typeof renderUserName === 'function' ? (renderUserName(prompt) || prompt) : prompt;
+
     const body = {
       model: settings.model || 'gpt-3.5-turbo',
-      messages: [{ role: 'user', content: prompt }],
+      messages: [{ role: 'user', content: finalPrompt }],
       temperature: Number.isFinite(Number(selectedTemperature)) ? Math.max(0, Number(selectedTemperature)) : 0.7,
       max_tokens: selectedMaxTokens
     };

@@ -45,6 +45,8 @@ window.WORLD_ENGINE_UI = (function() {
   let _wbCachedChatId = null;
   let _wbCachedScope = null;
   let _wbScrollTop = 0;
+  // 全局排除搜索词（模块级，跨 refresh() 存活，避免重渲染时丢输入）
+  let _wbExclSearch = '';
 
   // 引擎面扩展点：新增引擎按注册顺序进入“下一界面”循环。
   // 可提供 render/bind、主题/版本、设置、运行状态、球体 class 与卫星按钮动作等钩子。
@@ -1117,27 +1119,43 @@ window.WORLD_ENGINE_UI = (function() {
     document.getElementById(id('btn-filter-test'))?.addEventListener('click', () => {
       const core = window.WORLD_ENGINE_CORE;
       const status = document.getElementById(id('filter-status'));
-      if (!textarea.value.trim()) { showToast('未填写正则', true); if (status) status.textContent = '（未填写正则）'; return; }
-      const validated = core?.validateFilterRegex?.(textarea.value);
-      if (!validated) { showToast('core 模块不可用', true); return; }
-      if (validated.bad.length) {
-        if (status) status.textContent = `测试中止——⚠️ ${validated.ok} 条生效 / ${validated.bad.length} 条失败：\n` + validated.bad.map(item => `行 ${item.line}「${item.raw}」无效：${item.reason}`).join('\n');
-        showToast(`有 ${validated.bad.length} 条正则无效，请先修正`, true); return;
+      const useStRegex = document.getElementById(id('filter-use-st-regex'))?.checked === true;
+      if (!textarea.value.trim() && !useStRegex) { showToast('未填写正则', true); if (status) status.textContent = '（未填写正则）'; return; }
+      let validated = { ok: 0, bad: [], entries: [] };
+      if (textarea.value.trim()) {
+        const v = core?.validateFilterRegex?.(textarea.value);
+        if (!v) { showToast('core 模块不可用', true); return; }
+        if (v.bad.length) {
+          if (status) status.textContent = `测试中止——⚠️ ${v.ok} 条生效 / ${v.bad.length} 条失败：\n` + v.bad.map(item => `行 ${item.line}「${item.raw}」无效：${item.reason}`).join('\n');
+          showToast(`有 ${v.bad.length} 条正则无效，请先修正`, true); return;
+        }
+        validated = v;
       }
-      let sample = '';
+      let sample = '', sampleIsUser = false, sampleDepth = 0;
       try {
         const chat = SillyTavern.getContext()?.chat || [];
-        for (let i = chat.length - 1; i >= 0; i--) if (String(chat[i]?.mes || '').trim()) { sample = String(chat[i].mes); break; }
+        for (let i = chat.length - 1; i >= 0; i--) if (String(chat[i]?.mes || '').trim()) {
+          sample = String(chat[i].mes);
+          sampleIsUser = !!chat[i].is_user;
+          sampleDepth = chat.length - 1 - i;
+          break;
+        }
       } catch (error) {}
       if (!sample) { showToast('当前聊天没有可测试的文本', true); return; }
-      let work = sample, removed = 0;
+      let work = sample, removed = 0, stNote = '';
+      if (useStRegex) {
+        if (!core?.applyStRegex || core.stRegexReady?.() !== true) { showToast('酒馆正则模块未就绪，请刷新页面后重试', true); return; }
+        const before = work;
+        work = core.applyStRegex(work, sampleIsUser, sampleDepth);
+        stNote = `酒馆正则：${before.length} → ${work.length} 字符。\n`;
+      }
       for (const entry of validated.entries) {
         const regex = new RegExp(entry.pattern, entry.flags); let match, count = 0;
         while ((match = regex.exec(work)) !== null) { count++; if (match.index === regex.lastIndex) regex.lastIndex++; }
         work = work.replace(regex, ''); removed += count;
       }
-      if (status) status.textContent = `已删除 ${removed} 处。\n前: ${sample.slice(0, 60)}${sample.length > 60 ? '…' : ''}\n后: ${work.slice(0, 60)}${work.length > 60 ? '…' : ''}`;
-      showToast(`已删除 ${removed} 处`);
+      if (status) status.textContent = stNote + `已删除 ${removed} 处。\n前: ${sample.slice(0, 60)}${sample.length > 60 ? '…' : ''}\n后: ${work.slice(0, 60)}${work.length > 60 ? '…' : ''}`;
+      showToast(stNote ? `酒馆正则后，本扩展正则删除 ${removed} 处` : `已删除 ${removed} 处`);
     });
     let timer;
     textarea.addEventListener('input', () => { clearTimeout(timer); timer = setTimeout(syncTags, 300); });
@@ -1295,6 +1313,13 @@ window.WORLD_ENGINE_UI = (function() {
         <label>推演辅助 · 纪要之前追加总述数</label>
         <input type="number" id="we-memory-reference-big-count" min="0" step="1" value="${referenceBigSummaryCount}" style="width:100%;">
         <div style="font-size:11px;color:var(--we-text3);margin-top:3px;">从所选纪要之前继续向前取不重叠的总述；0 表示不追加总述。参考顺序固定为“总述 → 纪要 → 正文 → 本轮”。</div>
+      </div>
+      <div class="we-input-group" style="border-top:1px solid var(--we-border,#3a3a3a);padding-top:8px;">
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+          <input type="checkbox" id="we-memory-persona-enabled" ${settings.personaEnabled === true ? 'checked' : ''}>
+          读取酒馆用户人设（用户设定）
+        </label>
+        <div style="font-size:11px;color:var(--we-text3);margin-top:3px;">默认关闭。开启后，人物/实体提取前读取你在酒馆「用户设定」里填写的人设描述注入 prompt，便于判断用户作为知情人物（known_by）与其人际网络。只读、不写回酒馆；人设为空、或你在酒馆把人设注入位置设为「不注入」时自动不注入。</div>
       </div>`;
 
     const linkBody = `
@@ -1362,6 +1387,11 @@ window.WORLD_ENGINE_UI = (function() {
     const filterBody = `
       <div class="we-input-group">
         <label>每行一条正则，匹配内容会在喂记忆后台前删除</label>
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;margin-bottom:6px;">
+          <input type="checkbox" id="we-memory-filter-use-st-regex" ${settings.filterUseStRegex === true ? 'checked' : ''}>
+          同时走酒馆正则
+        </label>
+        <div style="font-size:11px;color:var(--we-text3);margin-top:3px;">勾选后，喂记忆后台前先过一遍你在酒馆「正则」面板里配置的脚本（只跑勾了「Alter Outgoing Prompt」的脚本，与酒馆发给 AI 的处理完全一致；按用户输入/AI 输出区分作用域，支持最小/最大深度限定）。之后再执行下方的本扩展正则，两者可同时开。</div>
         <div style="margin-bottom:8px;border:1px solid var(--we-border,#3a3a3a);border-radius:4px;padding:6px;">
           <div style="font-size:12px;color:var(--we-text2);margin-bottom:4px;">简单模式：勾选标签自动生成删除正则</div>
           <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-bottom:4px;">
@@ -1426,6 +1456,18 @@ window.WORLD_ENGINE_UI = (function() {
         <div style="font-size:12px;color:var(--we-text2);line-height:1.7;">
           面向长篇对话的独立记忆系统。人物记忆保留知情人边界，实体记忆维护组织、物件、能力与地点的当前状态和历史；纪要按新增轮次记录阶段事件，总述再将多条纪要压缩为长期脉络。
         </div>
+      </div>
+      <div class="we-section" style="margin-top:10px;">
+        <div class="we-section-title">v1.2.0 · 读取酒馆用户人设</div>
+        <ul class="we-changelog-items">
+          <li>「正文保留与推演参考」新增「读取酒馆用户人设」开关（默认关闭）：开启后，人物/实体提取前读取你在酒馆「用户设定」里填写的人设描述注入 prompt，便于判断用户作为知情人物（known_by）与其人际网络。纯只读；人设为空或你在酒馆把注入位置设为「不注入」时自动不注入。</li>
+        </ul>
+      </div>
+      <div class="we-section" style="margin-top:10px;">
+        <div class="we-section-title">v1.1.3 · 正则过滤可走酒馆正则</div>
+        <ul class="we-changelog-items">
+          <li>正则过滤新增「同时走酒馆正则」开关：勾选后，人物/实体提取与纪要生成读取的正文先按酒馆发给 AI 的同款方式过一遍酒馆「正则」面板脚本（只跑勾了「Alter Outgoing Prompt」的脚本），再执行本扩展正则；回填与重提取同样生效。</li>
+        </ul>
       </div>
       <div class="we-section" style="margin-top:10px;">
         <div class="we-section-title">v1.1.2 · 修复总述与纪要重复注入</div>
@@ -1927,6 +1969,14 @@ window.WORLD_ENGINE_UI = (function() {
   //   date    —— 可选，日期不确定的留月份/年份；
   //   items   —— 该版本改动条目（每条一行，渲染时走 h() 转义）。
   const CHANGELOG = [
+    { version: '3.4.0', date: '2026-10-14', items: ['新增「读取酒馆用户人设」（推演设置与记忆引擎的「正文保留与推演参考」各一个开关，默认关闭）：开启后，推演/记忆提取前读取你在酒馆「用户设定」里填写的人设描述，作为「{{user}} 的角色设定」注入 prompt——此前引擎自建请求只把 {{user}} 展开成名字，涉及{{user}}地位、权力、人际关系与行为倾向的推演判定没有依据。纯只读、不写回酒馆，人设为空、读取失败或你在酒馆把注入位置设为「不注入」时自动不注入（尊重酒馆原生设置），上限 4000 字防 prompt 膨胀；推演调试卡 prompt 分段新增「⑤a 用户人设」。', '「从正文自动回填时间」识别能力大幅扩展（仍是零配置通用能力，不依赖任何插件）：日期写法新增 中文数字年月日（二〇二五年十月三日、十月三日、初九/二十日）、全角字符（２０４９／１０／３）、点分隔（2049.10.3）、「号」结尾、分隔符混用（2049年10/3），以及只有月日的「10月3日」——年份继承同楼更靠前的最近一个完整日期，继承不到就放弃、绝不猜年份；思维链与 HTML 注释先剥离再解析。正文多日期（回忆、履历、倒叙极常见）不再无脑取最后一个：按「当前时间」语义打分选取——日期前有 现在/今天/如今/此刻 等当下线索的大幅优先，有 那年/三年前/曾经/回忆 等回溯线索或 明天/后天/计划 等未来线索的降权，都没有时取更靠后的；状态行会告知「正文含 N 个日期，已按当前时间语义选取」。回填成功后状态行新增来源标注（柏宝书时间标签/正文日期/正文仅月日）与识别到的时刻（23:30、深夜等）；柏宝书 <bbs_end> 标签仍是第一优先（语义=剧情结束时刻）。'] },
+    { version: '3.3.4', date: '2026-10-13', items: ['正则过滤新增「同时走酒馆正则」开关（推演设置与记忆引擎的过滤区各一个，互不影响）：勾选后喂后台前先按酒馆主生成同款方式过一遍你在酒馆「正则」面板里配置的脚本（只跑勾了「Alter Outgoing Prompt」的脚本，与酒馆发给 AI 的处理完全一致；按用户输入/AI 输出区分作用域，支持最小/最大深度限定）；之后再执行本扩展正则，两者可同时开。', '测试按钮支持单独试跑酒馆正则：勾选开关后正则框留空也能测试，状态行会给出酒馆正则前后的字符数；批量回填读取的对话同样先过酒馆正则。'] },
+    { version: '3.3.3', date: '2026-10-13', items: ['推演 prompt 分段顺序优化：「历史剧情摘要」从「⑤c 外部数据源」段中拆出，独立拼在「⑦ 近期对话」正前方（调试卡新增「⑥b 历史剧情摘要」分段）——摘要覆盖窗口起点之前的剧情，与近期对话时间连续，中间不再隔大块世界状态 JSON，模型能把两段读成一条完整时间线；「当前状态快照」仍留在 ⑤c 原位（它是现状事实参照，不属于时间线）。'] },
+    { version: '3.3.2', date: '2026-10-13', items: ['修复推演上下文窗口边缘楼层丢失（v3.3.0 回归）：重构读取窗口时「首楼为 AI 开场白」裁剪被错用到窗口上——每次推演把窗口内最旧的一条消息凭空切掉；搭配柏宝书等隐藏旧楼层的插件时，可见区收窄、窗口边缘那轮会被整轮丢弃（表现为中间一轮聊天没参与推演）。现开场白裁剪恢复为只对全聊天第 0 层生效一次，窗口完整读取。'] },
+    { version: '3.3.1', date: '2026-10-13', items: ['按时间推演新增「从正文自动回填时间」（推演设置 → 按时间区块）：一键从最新 AI 楼提取日期并按 年×360 + 月×30 + 日 算好总天数，写入三个时间框与存档——不再需要手算引导值。通用能力，不依赖任何插件：正文里找最后一个「YYYY/M/D」式日期（YYYY/M/D、YYYY-M-D、YYYY年M月D日 都认）；装有柏宝书且楼层带 <bbs_end> 时间标签时自动优先读标签（语义=剧情结束时刻，更权威）。6 框正则只在全部为空时预填「年/月/日 + 结束时刻」锚定方案，绝不覆盖用户已填配置。'] },
+    { version: '3.3.0', date: '2026-10-13', items: ['新增「上下文读取模式」（推演设置）：按轮（默认，旧行为，读最近 a 轮）与可见层（读全部未隐藏楼层，参考 choice 的全量上下文）二选一；隐藏楼层（🚫 屏蔽消息）两种模式都不参与推演。', '修复按轮模式读取轮数被静默钳制：原「读取轮数 a」被强制夹在「每几轮推演一次 X」以内（保存时覆盖 + 输入框 max 限制），X=5、a=5 想读 5 轮实际只读 1 轮；现 a 不再受 X 限制，超出聊天长度时读全部。', '新增「启用条目 EJS 渲染」开关（世界书设置，默认关闭）：开启后注入前先展开 {{user}} 等酒馆宏，再执行条目里的 <% %> 模板（需安装提示词模板插件 ST-Prompt-Template，未安装时只展宏不执行模板）；单条渲染失败自动退回原文，不影响其他条目。世界推演与记忆推演同时生效。'] },
+    { version: '3.2.0', date: '2026-10-13', items: ['新增「全局排除世界书」：世界书设置底部可按书名整本排除，被排除的世界书在所有聊天中都不参与推演（后台与记忆推演同时生效），优先于条目勾选；支持搜索添加与一键移除，条目勾选记录保留，移除排除后自动恢复参与，排除立即生效无需保存。'] },
+    { version: '3.1.0', date: '2026-10-13', items: ['新增「外部数据源」接入（设置 → 联动，单选）：可把柏宝书（ST-BaiBai-Book）或 SP·数据库（龙血玄黄·数据库）的记忆数据以只读方式作为世界事实参照注入推演 prompt，推演时与其保持一致、不得凭空改写；一次只接入一个，不叠加。', '桥接完全零耦合：通过对应插件的公开 API（globalThis.STBaiBaiBook / window.AutoCardUpdaterAPI）只读获取数据，不写入对方任何状态；外部插件未安装、未就绪或读取失败时自动静默为空，推演完全不受影响。', '数据库读取优先使用表格导出接口，无表格时回退读取其世界书总结条目（总结条目/重要人物条目/剧情大纲）；注入内容有单源 1.2 万字符上限防 prompt 膨胀，调试卡的 prompt 分段展示同步新增「⑤c 外部数据源」。'] },
     { version: '3.0.2', date: '2026-07-19', items: ['放宽事件链的早期创建条件：已有具体迹象的筹划、试探、调查起步或矛盾初现，可以在尚未成熟时进入事件链持续观察。', '放宽风声的传播起点：明确信息主题一旦开始公开发布、被他人听闻或转述、经渠道传递或形成小范围议论，即可创建，不再要求已影响其他持久状态。', '保留事件与风声的归并、去重和合法传播边界，避免放宽准入后产生重复条目或私密信息泄露。'] },
     { version: '3.0.1', date: '2026-07-16', items: ['修复云白、早樱浅色主题下事件链标题与 Lv.2 等级文字接近背景色、难以阅读的问题。', '事件等级、类型、阶段、推演结果、终局印章与倒计时改为浅色主题自适应对比度；深色主题保持原有配色。'] },
     { version: '3.0.0', date: '2026-07-14', items: ['世界引擎进入 3.0 正式版本：继续以独立世界状态推演、分层注入、本地事件机制、可编辑面板与聊天级存档为核心。', '记忆引擎 1.0 正式接入：人物、实体、纪要与总述保持独立数据和故障边界，并可按需向世界推演提供命中的最新人物与实体记忆。', '自动纪要从首次进入聊天时的当前层开始统计新增轮次；历史对话整理仅由纪要与总述批量重填执行。'] },
@@ -3438,7 +3488,8 @@ window.WORLD_ENGINE_UI = (function() {
       : JSON.parse(window.WORLD_ENGINE_STORE.getItem('world_engine_settings') || '{}');
     const mode = (settings.evolveMode === 'manual' || settings.evolveMode === 'time') ? settings.evolveMode : 'auto';
     const everyX = Math.max(1, parseInt(settings.evolveEveryX) || 1);
-    const readRounds = Math.min(everyX, Math.max(1, parseInt(settings.evolveReadRounds) || 1));
+    const readRounds = Math.max(1, parseInt(settings.evolveReadRounds) || 1);
+    const contextMode = settings.contextMode === 'visible' ? 'visible' : 'rounds';
     const manualReadRounds = Math.max(1, parseInt(settings.manualReadRounds) || 1);
     // 按时间模式的当前值
     const _stForTime = core.hasState() ? core.loadState() : null;
@@ -3531,17 +3582,38 @@ window.WORLD_ENGINE_UI = (function() {
         <input type="number" id="we-evolve-everyx" min="1" step="1" value="${everyX}" style="width:100%;">
         <div style="font-size:11px;color:var(--we-text3);margin-top:3px;">填 1 = 每轮推演；填 3 = 每向前 3 轮推演一次。重 roll 不计入轮数。</div>
       </div>
-      <div class="we-input-group" id="we-evolve-readrounds-group" style="${mode === 'auto' ? '' : 'display:none;'}">
-        <label>每次推演读取最近几轮对话（a）</label>
-        <input type="number" id="we-evolve-readrounds" min="1" max="${everyX}" step="1" value="${readRounds}" style="width:100%;">
-        <div style="font-size:11px;color:var(--we-text3);margin-top:3px;">从当前层往前取 a 轮的「用户输入 + AI 输出」喂给后台推演。最小 1，最大不超过 X（每次推演的轮数）。默认 1 = 只读最新一轮。</div>
+      <div class="we-input-group">
+        <label>上下文读取模式</label>
+        <select id="we-context-mode" style="width:100%;">
+          <option value="rounds" ${contextMode === 'rounds' ? 'selected' : ''}>按轮（读最近 a 轮对话）</option>
+          <option value="visible" ${contextMode === 'visible' ? 'selected' : ''}>可见层（读全部未隐藏楼层）</option>
+        </select>
+        <div style="font-size:11px;color:var(--we-text3);margin-top:3px;">按轮 = 只取最近的对话窗口喂给推演，长对话省 token；可见层 = 从头到尾全部未隐藏楼层都喂给推演（类似 choice 的全量上下文），长对话会显著增加 token 消耗。隐藏楼层（🚫 屏蔽的消息）两种模式都不参与。</div>
       </div>
-      <div class="we-input-group" id="we-manual-readrounds-group" style="${mode === 'manual' ? '' : 'display:none;'}">
+      <div class="we-input-group" id="we-evolve-readrounds-group" style="${(mode === 'auto' && contextMode !== 'visible') ? '' : 'display:none;'}">
+        <label>每次推演读取最近几轮对话（a）</label>
+        <input type="number" id="we-evolve-readrounds" min="1" step="1" value="${readRounds}" style="width:100%;">
+        <div style="font-size:11px;color:var(--we-text3);margin-top:3px;">从当前层往前取 a 轮的「用户输入 + AI 输出」喂给后台推演。最小 1，无上限（超出聊天长度时读全部）。默认 1 = 只读最新一轮。</div>
+      </div>
+      <div class="we-input-group" id="we-manual-readrounds-group" style="${(mode === 'manual' && contextMode !== 'visible') ? '' : 'display:none;'}">
         <label>手动推演读取最近几轮对话</label>
         <input type="number" id="we-manual-readrounds" min="1" step="1" value="${manualReadRounds}" style="width:100%;">
         <div style="font-size:11px;color:var(--we-text3);margin-top:3px;">点击「向前推进」或「重新推进」时，从当前层往前取这些轮的「用户输入 + AI 输出」喂给后台推演。默认 1 = 只读最新一轮。</div>
       </div>
+      <div class="we-input-group" style="border-top:1px solid var(--we-border,#3a3a3a);padding-top:8px;">
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+          <input type="checkbox" id="we-persona-enabled" ${settings.personaEnabled === true ? 'checked' : ''}>
+          读取酒馆用户人设（用户设定）
+        </label>
+        <div style="font-size:11px;color:var(--we-text3);margin-top:3px;">默认关闭。开启后，每次推演前读取你在酒馆「用户设定」里填写的人设描述，作为「{{user}} 的角色设定」注入 prompt（调试卡可见 ⑤a 段），让涉及{{user}}地位、权力、人际关系与行为倾向的推演判定有据可依。只读、不写回酒馆；人设为空、或你在酒馆把人设注入位置设为「不注入」时自动不注入。上限 4000 字。</div>
+      </div>
       <div id="we-evolve-time-group" style="${mode === 'time' ? '' : 'display:none;'}">
+        <div class="we-input-group" style="border:1px solid var(--we-border);border-radius:6px;padding:8px;background:var(--we-bg);">
+          <label style="font-weight:700;">🕰 从正文自动回填时间</label>
+          <div style="font-size:11px;color:var(--we-text3);margin:3px 0 6px;">读最新 AI 楼：装有柏宝书时优先读它的 &lt;bbs_end&gt; 时间标签，没有则直接从正文里提取日期，按 年×360 + 月×30 + 日 算总天数写入三个时间框与存档。认的写法：YYYY/M/D、YYYY-M-D、YYYY.M.D、YYYY年M月D日、中文数字（二〇二五年十月三日、十月三日、初九）、全角字符、以及只有月日的「10月3日」（年份取同楼更靠前的完整日期，取不到不猜）。正文里日期多时（回忆、倒叙常见）按「当前时间」语义选取：有 现在/今天/如今 等当下线索的优先，回溯/明天/计划 类日期降权，都没有就取更靠后的。6 框正则只在全部为空时预填（方案随日期来源自适应：柏宝书标签→带结束时刻，正文→通用日期），不会覆盖你已填的配置。</div>
+          <button class="we-btn" id="we-time-bbs-autofill" style="width:100%;">从最新楼层自动回填时间</button>
+          <div style="font-size:11px;color:var(--we-text3);margin-top:4px;" id="we-time-bbs-autofill-status"></div>
+        </div>
         <div class="we-input-group" style="display:flex;gap:6px;">
           <div style="flex:1;"><label>取正文前 N 字</label><input type="number" id="we-time-front" min="0" step="1" value="${tv('evolveTimeFront', 0)}" style="width:100%;"></div>
           <div style="flex:1;"><label>取正文后 N 字</label><input type="number" id="we-time-back" min="0" step="1" value="${tv('evolveTimeBack', 80)}" style="width:100%;"></div>
@@ -3567,7 +3639,7 @@ window.WORLD_ENGINE_UI = (function() {
           <label>满 N 天推演一次</label>
           <input type="number" id="we-time-threshold" min="1" step="1" value="${tv('evolveTimeThreshold',1)}" style="width:100%;">
         </div>
-        <div class="we-input-group">
+        <div class="we-input-group" id="we-time-maxrounds-group" style="${contextMode === 'visible' ? 'display:none;' : ''}">
           <label>最多读取最近 X 轮对话</label>
           <input type="number" id="we-time-maxrounds" min="1" step="1" value="${tv('evolveTimeMaxRounds',10)}" style="width:100%;">
           <div style="font-size:11px;color:var(--we-text3);margin-top:3px;">自上次推演以来跨了几轮就读几轮，超过 X 则只读最近 X 轮，封顶防止 prompt 过长。</div>
@@ -3590,6 +3662,11 @@ window.WORLD_ENGINE_UI = (function() {
     const filterBody = `
       <div class="we-input-group">
         <label>每行一条正则，匹配内容会在喂后台前删除</label>
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;margin-bottom:6px;">
+          <input type="checkbox" id="we-filter-use-st-regex" ${settings.filterUseStRegex === true ? 'checked' : ''}>
+          同时走酒馆正则
+        </label>
+        <div style="font-size:11px;color:var(--we-text3);margin-top:3px;">勾选后，喂后台推演前先过一遍你在酒馆「正则」面板里配置的脚本（只跑勾了「Alter Outgoing Prompt」的脚本，与酒馆发给 AI 的处理完全一致；按用户输入/AI 输出区分作用域，支持最小/最大深度限定）。之后再执行下方的本扩展正则，两者可同时开。</div>
         <div style="margin-bottom:8px;border:1px solid var(--we-border,#3a3a3a);border-radius:4px;padding:6px;">
           <div style="font-size:12px;color:var(--we-text2);margin-bottom:4px;">简单模式：勾选标签自动生成删除正则</div>
           <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-bottom:4px;">
@@ -3638,6 +3715,24 @@ window.WORLD_ENGINE_UI = (function() {
         <div style="font-size:11px;color:var(--we-text3);margin-top:3px;">开启后，世界 API 的本轮返回会交给记忆 API 更新人物与实体，并把世界摘要新增为一条纪要。同楼层重 roll 只撤销带联动标记的旧结果，不影响普通记忆与原有纪要。</div>
         <button class="we-btn we-btn-primary" id="we-memory-link-now" type="button" style="width:100%;margin-top:8px;"><i class="fa-solid fa-link"></i> 手动联动当前世界信息</button>
         <div style="font-size:11px;color:var(--we-text3);margin-top:3px;">立即把当前世界状态交给记忆引擎处理，并把当前世界摘要新增为纪要；同楼层重复执行会替换上一次联动结果。</div>
+      </div>
+      <div class="we-input-group" style="border-top:1px solid var(--we-border,#3a3a3a);padding-top:8px;">
+        <label>外部数据源（单选，推演时只读参照）</label>
+        <div style="display:flex;flex-direction:column;gap:6px;margin-top:4px;">
+          <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+            <input type="radio" name="we-bridge-source" value="off" ${(settings.bridgeSource || 'off') === 'off' ? 'checked' : ''}>
+            不接入（默认）
+          </label>
+          <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+            <input type="radio" name="we-bridge-source" value="baibaibook" ${settings.bridgeSource === 'baibaibook' ? 'checked' : ''}>
+            柏宝书（ST-BaiBai-Book）
+          </label>
+          <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+            <input type="radio" name="we-bridge-source" value="shujuku" ${settings.bridgeSource === 'shujuku' ? 'checked' : ''}>
+            SP·数据库（龙血玄黄·数据库）
+          </label>
+        </div>
+        <div style="font-size:11px;color:var(--we-text3);margin-top:4px;">选中一个数据源后，每次推演会只读读取它的记忆数据作为世界事实参照注入推演 prompt（与柏宝书/数据库记忆互斥，一次只注入一个，不叠加）：柏宝书=当前快照（状态/主角/人物/物品/变量等）；SP·数据库=表格数据（优先表格导出，回退世界书总结条目）。对应插件未安装或读取失败时自动为空，推演不受影响。只读取，不写入对方。</div>
       </div>`;
 
     const displayMode = settings.displayMode === 'expand' ? 'expand' : 'mask';
@@ -3885,6 +3980,13 @@ window.WORLD_ENGINE_UI = (function() {
           </label>
           <div style="font-size:11px;color:var(--we-text3);margin-top:3px;">关闭时：已选条目全部注入推演（现状）。开启后：🔵常驻条目恒注入，🟢关键词条目仅在近期对话命中其关键词时注入；每条可单独覆写。关键词扫描由本扩展自行完成，与酒馆解耦。</div>
         </div>
+        <div class="we-input-group">
+          <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+            <input type="checkbox" id="we-worldbook-ejs" ${settings.worldbookEjsRender === true ? 'checked' : ''}>
+            启用条目 EJS 渲染
+          </label>
+          <div style="font-size:11px;color:var(--we-text3);margin-top:3px;">默认关闭（条目原文注入）。开启后注入前先展开 {{user}} 等酒馆宏，再执行条目里的 &lt;% %&gt; 模板（需安装「提示词模板」插件 ST-Prompt-Template；未安装时只展宏不执行模板）。单条渲染失败自动退回原文，不影响其他条目。</div>
+        </div>
         <div class="we-worldbook-header">
           <div><div class="we-worldbook-summary" id="we-worldbook-summary">正在读取当前聊天世界书...</div></div>
           <button class="we-icon-btn" id="we-worldbook-reload" title="重新读取当前聊天世界书"><i class="fa-solid fa-rotate"></i></button>
@@ -3895,6 +3997,13 @@ window.WORLD_ENGINE_UI = (function() {
           <button class="we-btn we-btn-primary" id="we-worldbook-save">保存世界书选择</button>
         </div>
         <div class="we-worldbook-list" id="we-worldbook-list"><div class="we-empty">正在读取...</div></div>
+        <div class="we-input-group" style="margin-top:10px;">
+          <label style="font-weight:700;">🚫 全局排除世界书</label>
+          <div style="font-size:11px;color:var(--we-text3);margin-top:3px;">被排除的世界书在所有聊天中都不参与${memoryScope ? '记忆' : '后台'}推演（优先于下方条目勾选）；条目勾选记录保留，移除排除后自动恢复参与。立即生效，无需保存。</div>
+          <div class="we-wb-excl-chips" id="we-wb-excl-chips"></div>
+          <input type="text" id="we-wb-excl-search" placeholder="搜索书名以添加排除…" style="width:100%;margin-top:6px;">
+          <div class="we-wb-excl-candidates" id="we-wb-excl-candidates"></div>
+        </div>
       </div>`;
     const dataBody = `
       <div style="display:flex;gap:6px;flex-wrap:wrap;">
@@ -4580,6 +4689,19 @@ window.WORLD_ENGINE_UI = (function() {
       };
     });
 
+    // 居中当前选项卡：只在 .we-settings-tabs 容器内部滚动。
+    // scrollIntoView 会沿祖先链滚动所有可滚动容器，fixed 面板里也会把
+    // body/documentElement 横向卷动，导致整个酒馆界面跟着左移。
+    function centerSettingsTab(tabEl, smooth) {
+      const tabsEl = document.getElementById('we-settings-tabs');
+      if (!tabsEl || !tabEl || !tabsEl.contains(tabEl)) return;
+      const tabsRect = tabsEl.getBoundingClientRect();
+      const tabRect = tabEl.getBoundingClientRect();
+      const max = Math.max(0, tabsEl.scrollWidth - tabsEl.clientWidth);
+      const left = tabsEl.scrollLeft + (tabRect.left + tabRect.width / 2) - (tabsRect.left + tabsRect.width / 2);
+      tabsEl.scrollTo({ left: Math.max(0, Math.min(left, max)), behavior: smooth ? 'smooth' : 'auto' });
+    }
+
     // [FIX] 设置页选项卡切换：纯 CSS 显隐，不重新渲染（保护输入内容 + 字段常驻 DOM 保证保存不丢）
     document.querySelectorAll('.we-settings-tab').forEach(tab => {
       tab.onclick = () => {
@@ -4591,7 +4713,7 @@ window.WORLD_ENGINE_UI = (function() {
           t.classList.toggle('we-settings-tab--active', t.dataset.tab === key));
         document.querySelectorAll('.we-settings-panel').forEach(p =>
           p.style.display = (p.dataset.tab === key) ? '' : 'none');
-        tab.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'center' });
+        centerSettingsTab(tab, true);
         // [FIX] 切到调试 tab 时，局部刷新 renderDebug 拉最新一轮推演数据（不动其它 tab 输入）
         if (key === 'debug') {
           if (typeof face.refreshDebug === 'function') face.refreshDebug();
@@ -4618,7 +4740,7 @@ window.WORLD_ENGINE_UI = (function() {
     if (settingsTabs) {
       settingsTabs.addEventListener('scroll', updateSettingsTabScroll, { passive: true });
       const activeTab = settingsTabs.querySelector('.we-settings-tab--active');
-      if (activeTab) activeTab.scrollIntoView({ block: 'nearest', inline: 'center' });
+      if (activeTab) centerSettingsTab(activeTab, false);
       document.querySelectorAll('.we-settings-tab-scroll').forEach(btn => {
         btn.onclick = () => {
           const dir = Number(btn.dataset.dir) || 1;
@@ -4896,9 +5018,12 @@ window.WORLD_ENGINE_UI = (function() {
           apiAutoRetries: Math.max(0, parseInt(gv('we-memory-api-auto-retries')) || 0),
           nameBlacklist: gv('we-memory-name-blacklist') || '',
           filterRegex: gv('we-memory-filter-regex') || '',
+          filterUseStRegex: document.getElementById('we-memory-filter-use-st-regex')?.checked === true,
           tonePrompt: gv('we-memory-tone-prompt') || '',
           worldbookEnabled: document.getElementById('we-memory-worldbook-enabled')?.checked === true,
           worldbookTrigger: document.getElementById('we-worldbook-trigger')?.checked === true,
+          worldbookEjsRender: document.getElementById('we-worldbook-ejs')?.checked === true,
+          personaEnabled: document.getElementById('we-memory-persona-enabled')?.checked === true,
           syncToChat: document.getElementById('we-memory-sync-to-chat')?.checked === true,
           autoBackup: document.getElementById('we-memory-auto-backup')?.checked === true,
           backfillBatchSize: Math.max(1, parseInt(gv('we-memory-backfill-batch')) || 5),
@@ -5085,13 +5210,22 @@ window.WORLD_ENGINE_UI = (function() {
           injectMaxChars: Math.max(0, parseInt(gv('we-inject-max-chars')) || 0),
           injectAllLevels: document.getElementById('we-inject-all-levels')?.checked === true,
           memoryLinkEnabled: document.getElementById('we-memory-link-enabled')?.checked === true,
+          // 外部数据源单选：'off' | 'baibaibook' | 'shujuku'（非法值按不接入处理）
+          bridgeSource: (function () {
+            const v = (document.querySelector('input[name="we-bridge-source"]:checked') || {}).value;
+            return v === 'baibaibook' || v === 'shujuku' ? v : 'off';
+          })(),
           syncToChat: document.getElementById('we-sync-to-chat')?.checked === true,
           autoBackup: document.getElementById('we-auto-backup')?.checked === true,
           evolveMode: (_modeRaw === 'manual' || _modeRaw === 'time') ? _modeRaw : 'auto',
           evolveEveryX: Math.max(1, parseInt(document.getElementById('we-evolve-everyx')?.value) || 1),
           evolveReadRounds: Math.max(1, parseInt(document.getElementById('we-evolve-readrounds')?.value) || 1),
           manualReadRounds: Math.max(1, parseInt(document.getElementById('we-manual-readrounds')?.value) || 1),
+          personaEnabled: document.getElementById('we-persona-enabled')?.checked === true,
+          // 上下文读取模式：'rounds'=按轮 | 'visible'=可见层（非法值按轮）
+          contextMode: document.getElementById('we-context-mode')?.value === 'visible' ? 'visible' : 'rounds',
           evolveFilterRegex: gv('we-filter-regex') || '',
+          filterUseStRegex: document.getElementById('we-filter-use-st-regex')?.checked === true,
           displayMode: document.getElementById('we-display-mode')?.value === 'expand' ? 'expand' : 'mask',
           // 按时间模式
           evolveTimeFront: Math.max(0, parseInt(gv('we-time-front')) || 0),
@@ -5148,8 +5282,6 @@ window.WORLD_ENGINE_UI = (function() {
           localWindSentimentLinear: Math.max(0, parseFloat(gv('we-local-wind-sentiment-linear')) || 0),
           localWindSentimentQuadratic: Math.max(0, parseFloat(gv('we-local-wind-sentiment-quadratic')) || 0)
         };
-        // a 不得超过 X（每次推演的轮数）
-        ns.evolveReadRounds = Math.min(ns.evolveReadRounds, ns.evolveEveryX);
         window.WORLD_ENGINE_STORE.setItem('world_engine_settings', JSON.stringify(ns));
         if (window.WORLD_ENGINE_API) window.WORLD_ENGINE_API.getSettings(true);
 
@@ -5188,22 +5320,97 @@ window.WORLD_ENGINE_UI = (function() {
       };
     }
 
-    // 推演模式切换：按轮显示 X/a，按时间显示时间组，手动显示手动读取轮数
+    // 从正文自动回填时间：通用日期提取（柏宝书标签优先、正文日期回退），6 框仅在空时预填
+    const bbsAutofillBtn = document.getElementById('we-time-bbs-autofill');
+    if (bbsAutofillBtn) {
+      bbsAutofillBtn.onclick = () => {
+        const statusEl = document.getElementById('we-time-bbs-autofill-status');
+        const say = (text, isErr) => {
+          if (statusEl) { statusEl.textContent = text; statusEl.style.color = isErr ? 'var(--we-danger, #e06060)' : 'var(--we-text3)'; }
+        };
+        const we = window.WORLD_ENGINE;
+        if (!we || typeof we.parseLatestStoryDay !== 'function') { say('解析模块未加载', true); return; }
+        const chat = (window.SillyTavern?.getContext?.() || {})?.chat || [];
+        const result = we.parseLatestStoryDay(chat);
+        if (!result) {
+          say('未提取到日期：最新楼层正文里没有可识别的日期（YYYY/M/D、YYYY年M月D日、二〇二五年十月三日、10月3日 等；仅月日需同楼有更早的完整日期补年份），也没装柏宝书或无时间标签。复杂日期格式仍可用下方 6 框正则手动配置。', true);
+          return;
+        }
+        // ① 写三个时间框
+        const setVal = (id, v) => { const el = document.getElementById(id); if (el) el.value = String(v); };
+        setVal('we-time-state', result.total);
+        setVal('we-time-checkpoint', result.total);
+        setVal('we-time-current', '');
+        // ② 6 框正则只在全部为空时预填锚定方案，绝不覆盖用户已填配置。
+        // 预填方案随日期来源自适应：柏宝书标签 → 「年/月/日 + 结束时刻」（锚定 </bbs_end>）；
+        // 正文日期 → 通用「YYYY/M/D」（YYYY/M/D、YYYY-M-D、YYYY年M月D日 三种分隔都认）。
+        // 注意 6 框体系按 cnToNum 逐框换算，只预填阿拉伯数字方案——中文数字年份
+        // （二〇二五）是逐位记法，塞进 6 框会被位值换算错，需要时用户自己配框。
+        const boxIds = ['we-time-re1', 'we-time-re2', 'we-time-re3', 'we-time-re4', 'we-time-re5', 'we-time-re6'];
+        const allEmpty = boxIds.every(id => !(document.getElementById(id)?.value || '').trim());
+        let presetNote = '6 框正则保持你已填的配置';
+        if (allEmpty) {
+          setVal('we-time-front', 0);
+          setVal('we-time-back', 0);
+          setVal('we-time-re1', '\\d{4}');
+          setVal('we-time-re3', '\\d{1,2}');
+          setVal('we-time-mul1', 360); setVal('we-time-mul2', 30); setVal('we-time-mul3', 1);
+          if (result.source === 'baibai-tag') {
+            setVal('we-time-re2', '/');
+            setVal('we-time-re4', '/');
+            setVal('we-time-re5', '\\d{1,2}\\s+\\d{1,2}:\\d{2}</bbs_end>');
+            setVal('we-time-re6', '');
+            presetNote = '6 框正则为空，已预填「年/月/日 + 结束时刻」方案';
+          } else {
+            setVal('we-time-re2', '[/年\\-]');
+            setVal('we-time-re4', '[月/\\-]');
+            setVal('we-time-re5', '\\d{1,2}');
+            setVal('we-time-re6', '');
+            presetNote = '6 框正则为空，已预填正文「YYYY/M/D」日期方案（YYYY/M/D、YYYY-M-D、YYYY年M月D日 都认）';
+          }
+        }
+        // ③ 直接写存档（与「保存设置」的时间框路径同款：有值才写）
+        const st = core.hasState() ? core.loadState() : null;
+        if (st) { st.time = result.total; core.saveState(st); }
+        const cp = core.restoreCheckpoint();
+        if (cp) { cp.time = result.total; core.saveCheckpoint(cp); }
+        const sourceLabel = { 'baibai-tag': '柏宝书时间标签', 'text-md': '正文日期（仅月日，年份取同楼更早日期）' }[result.source] || '正文日期';
+        const dateLabel = result.clock ? `${result.year}/${result.month}/${result.day} ${result.clock}` : `${result.year}/${result.month}/${result.day}`;
+        const multiNote = result.candidateCount > 1 ? `；正文含 ${result.candidateCount} 个日期，已按当前时间语义选取` : '';
+        say(`已回填：${dateLabel}（${sourceLabel}，第 ${result.floor + 1} 楼）→ 总天数 ${result.total}${multiNote}。${presetNote}，点击「保存设置」后生效。`);
+        showToast(`时间回填成功：总天数 ${result.total}`);
+      };
+    }
+
+    // 推演模式切换：按轮显示 X/a，按时间显示时间组，手动显示手动读取轮数。
+    // 上下文模式为「可见层」时，三处的「读取轮数」输入都不需要（全量楼层喂给推演）。
     const evolveModeSel = document.getElementById('we-evolve-mode');
+    const contextModeSel = document.getElementById('we-context-mode');
+    const isCtxVisible = () => contextModeSel?.value === 'visible';
+    function syncReadRoundsVisibility() {
+      const v = evolveModeSel?.value;
+      const manualShow = v === 'manual' && !isCtxVisible() ? '' : 'none';
+      const g1 = document.getElementById('we-evolve-everyx-group');
+      if (g1) g1.style.display = v === 'auto' ? '' : 'none';
+      const g2 = document.getElementById('we-evolve-readrounds-group');
+      if (g2) g2.style.display = (v === 'auto' && !isCtxVisible()) ? '' : 'none';
+      const g3 = document.getElementById('we-manual-readrounds-group');
+      if (g3) g3.style.display = manualShow;
+      const g4 = document.getElementById('we-evolve-time-group');
+      if (g4) g4.style.display = v === 'time' ? '' : 'none';
+      const g5 = document.getElementById('we-time-maxrounds-group');
+      if (g5) g5.style.display = isCtxVisible() ? 'none' : '';
+    }
     if (evolveModeSel) {
       evolveModeSel.onchange = () => {
-        const v = evolveModeSel.value;
-        const roundShow = v === 'auto' ? '' : 'none';
-        const manualShow = v === 'manual' ? '' : 'none';
-        const timeShow = v === 'time' ? '' : 'none';
-        const g1 = document.getElementById('we-evolve-everyx-group');
-        if (g1) g1.style.display = roundShow;
-        const g2 = document.getElementById('we-evolve-readrounds-group');
-        if (g2) g2.style.display = roundShow;
-        const g3 = document.getElementById('we-manual-readrounds-group');
-        if (g3) g3.style.display = manualShow;
-        const g4 = document.getElementById('we-evolve-time-group');
-        if (g4) g4.style.display = timeShow;
+        syncReadRoundsVisibility();
+      };
+    }
+
+    // 上下文读取模式切换：可见层隐藏所有「读取轮数」输入
+    if (contextModeSel) {
+      contextModeSel.onchange = () => {
+        syncReadRoundsVisibility();
       };
     }
 
@@ -5290,12 +5497,14 @@ window.WORLD_ENGINE_UI = (function() {
         }
         worldbookList.innerHTML = [...groups.entries()].map(([world, worldEntries]) => {
           const expanded = expandedWorldbookGroups.has(world);
+          const bookExcluded = worldEntries.every(entry => entry.globallyExcluded);
+          const exclBadge = bookExcluded ? ' <span class="we-wb-group-excluded" title="该书已全局排除，条目不参与推演">🚫已排除</span>' : '';
           return `
-          <div class="we-worldbook-group" data-worldbook-group="${u(world)}">
+          <div class="we-worldbook-group${bookExcluded ? ' is-book-excluded' : ''}" data-worldbook-group="${u(world)}">
             <div class="we-worldbook-group-header">
               <span>${expanded ? '▼' : '▶'}</span>
               <div class="we-worldbook-group-title">
-                <div>${u(world)} <span>${worldEntries.length}条</span></div>
+                <div>${u(world)}${exclBadge} <span>${worldEntries.length}条</span></div>
               </div>
               <div class="we-worldbook-group-actions">
                 <button type="button" data-worldbook-group-action="select">全选</button>
@@ -5307,6 +5516,7 @@ window.WORLD_ENGINE_UI = (function() {
               const keys = entry.keys || [];
               const badge = entry.constant ? '🔵' : (entry.vectorized ? '🔗' : (keys.length ? '🟢' : '⚪'));
               const keyHint = keys.length ? ' · 关键词：' + keys.slice(0, 5).join('、') + (keys.length > 5 ? '…' : '') : '';
+              const exclHint = entry.globallyExcluded ? ' · 🚫已全局排除' : '';
               const ov = overrides[entry.id] || 'auto';
               const overrideSel = (triggerOn && !entry.disabled) ? `
                 <select class="we-wb-override" data-entry-id="${u(entry.id)}" title="该条触发方式">
@@ -5316,12 +5526,12 @@ window.WORLD_ENGINE_UI = (function() {
                   <option value="off"${ov === 'off' ? ' selected' : ''}>关闭</option>
                 </select>` : '';
               return `
-              <div class="we-worldbook-entry${entry.disabled ? ' is-disabled' : ''}">
+              <div class="we-worldbook-entry${entry.disabled ? ' is-disabled' : ''}${entry.globallyExcluded ? ' is-globally-excluded' : ''}">
                 <label class="we-wb-entry-main">
                   <input class="we-worldbook-entry-check" type="checkbox" value="${u(entry.id)}" data-chars="${entry.content.length}" ${selectedIds.has(entry.id) && !entry.disabled ? 'checked' : ''} ${entry.disabled ? 'disabled' : ''}>
                   <span>
                     <strong>${badge} ${u(entry.title)}</strong>
-                    <small>${entry.content.length} 字符${u(keyHint)}${entry.disabled ? ' · 世界书内已停用' : ''}</small>
+                    <small>${entry.content.length} 字符${u(keyHint)}${exclHint}${entry.disabled ? ' · 世界书内已停用' : ''}</small>
                   </span>
                 </label>${overrideSel}
               </div>`;
@@ -5410,12 +5620,92 @@ window.WORLD_ENGINE_UI = (function() {
         showToast(triggerBox.checked ? '已开启蓝绿灯触发' : '已关闭蓝绿灯触发（恢复全部已选注入）');
         renderWorldbookList(); // 重渲染以显示/隐藏每条的触发覆写下拉
       };
+      // EJS 渲染开关：与世界引擎设置页保存路径同款（记忆面走 patchSettings，世界面直写 settings 键）
+      const ejsBox = document.getElementById('we-worldbook-ejs');
+      if (ejsBox) ejsBox.onchange = () => {
+        if (worldbookScope === 'memory') {
+          window.MEMORY_ENGINE_SETTINGS?.patchSettings({ worldbookEjsRender: ejsBox.checked });
+        } else {
+          const wapi = window.WORLD_ENGINE_API;
+          const cur = wapi && wapi.getSettings ? wapi.getSettings(true) : {};
+          window.WORLD_ENGINE_STORE.setItem('world_engine_settings', JSON.stringify({ ...cur, worldbookEjsRender: ejsBox.checked }));
+          if (wapi && wapi.getSettings) wapi.getSettings(true);
+        }
+        showToast(ejsBox.checked ? '已开启条目 EJS 渲染' : '已关闭条目 EJS 渲染（恢复原文注入）');
+      };
       // refresh() 重建 DOM 时，如果 chatId 未变且已有缓存，直接渲染，避免勾选丢失
       const currentChatIdNow = worldbook.getChatId ? worldbook.getChatId() : (window.WORLD_ENGINE_CORE?.getChatId?.() || 'default');
       if (_wbCachedEntries && _wbCachedChatId === currentChatIdNow && _wbCachedScope === worldbookScope) {
         renderWorldbookList();
       } else {
         loadWorldbookEntries();
+      }
+
+      // ========== 全局排除世界书（参考 choice 的 global_excluded_books 交互）==========
+      const exclChips = document.getElementById('we-wb-excl-chips');
+      const exclSearch = document.getElementById('we-wb-excl-search');
+      const exclCandidates = document.getElementById('we-wb-excl-candidates');
+      if (exclChips && exclSearch && exclCandidates && worldbook) {
+        let allBookNames = null; // 惰性拉取一次的酒馆世界书全集
+        let exclRenderSeq = 0;   // 候选列表渲染序号：快速连续输入时只接受最新一次渲染，避免旧关键词后落地
+
+        function renderExclChips() {
+          const list = worldbook.getGlobalExcludedBooks();
+          exclChips.innerHTML = list.length
+            ? list.map(name =>
+                `<span class="we-wb-excl-chip"><span>${u(name)}</span><button type="button" data-excl-remove="${u(name)}" title="移除全局排除">×</button></span>`
+              ).join('')
+            : '<span class="we-wb-excl-empty">未设置全局排除</span>';
+          exclChips.querySelectorAll('[data-excl-remove]').forEach(btn => {
+            btn.onclick = () => {
+              worldbook.removeGlobalExcludedBook(btn.dataset.exclRemove);
+              _wbCachedEntries = null; // 条目的 globallyExcluded 标记已过期，强制重读
+              if (_wbCachedScope != null) loadWorldbookEntries();
+              renderExclChips();
+              renderExclCandidates();
+              showToast(`已移除全局排除：${btn.dataset.exclRemove}`);
+            };
+          });
+        }
+
+        async function ensureBookNames() {
+          if (allBookNames) return allBookNames;
+          exclCandidates.innerHTML = '<div class="we-wb-excl-empty">正在读取书单...</div>';
+          allBookNames = await worldbook.getAllWorldBookNames();
+          return allBookNames;
+        }
+
+        async function renderExclCandidates() {
+          const seq = ++exclRenderSeq;
+          const kw = _wbExclSearch.trim().toLowerCase();
+          const excluded = new Set(worldbook.getGlobalExcludedBooks());
+          const names = await ensureBookNames();
+          if (seq !== exclRenderSeq) return; // 已有更新的渲染请求（用户又输入了），丢弃本次旧结果
+          const matches = names.filter(name => !excluded.has(name) && (!kw || name.toLowerCase().includes(kw)));
+          exclCandidates.innerHTML = matches.length
+            ? matches.map(name =>
+                `<div class="we-wb-excl-row" data-excl-add="${u(name)}"><span>${u(name)}</span><button type="button">排除</button></div>`
+              ).join('')
+            : '<div class="we-wb-excl-empty">无可添加的世界书</div>';
+          exclCandidates.querySelectorAll('[data-excl-add]').forEach(row => {
+            row.onclick = () => {
+              worldbook.addGlobalExcludedBook(row.dataset.exclAdd);
+              _wbCachedEntries = null; // 条目的 globallyExcluded 标记已过期，强制重读
+              if (_wbCachedScope != null) loadWorldbookEntries();
+              renderExclChips();
+              renderExclCandidates();
+              showToast(`已全局排除世界书：${row.dataset.exclAdd}`);
+            };
+          });
+        }
+
+        exclSearch.addEventListener('input', () => {
+          _wbExclSearch = exclSearch.value;
+          renderExclCandidates();
+        });
+        exclSearch.addEventListener('keydown', e => e.stopPropagation()); // 不把按键透传给面板快捷键
+        renderExclChips();
+        renderExclCandidates();
       }
     }
 

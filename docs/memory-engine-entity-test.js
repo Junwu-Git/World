@@ -1,8 +1,8 @@
-const fs = require('fs');
-const vm = require('vm');
-const path = require('path');
+import path from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
-const root = path.resolve(__dirname, '..');
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const importModule = file => import(pathToFileURL(path.join(root, file)));
 const storage = new Map();
 let injection = '';
 let apiResponse = '';
@@ -22,7 +22,7 @@ global.SillyTavern = {
 };
 global.WORLD_ENGINE_STORE = {
   getItem: key => storage.has(key) ? storage.get(key) : null,
-  setItem: (key, value) => storage.set(key, value),
+  setItem: (key, value) => storage.set(key, String(value)),
   removeItem: key => storage.delete(key)
 };
 global.WORLD_ENGINE_CORE = {
@@ -34,9 +34,9 @@ global.WORLD_ENGINE_UI = { setMemoryEvolvingUI: () => {} };
 
 for (const file of ['memory-engine-settings.js', 'memory-engine-data.js', 'memory-engine-prompt.js',
   'memory-engine-small-summary-prompt.js', 'memory-engine-big-summary-prompt.js', 'memory-engine.js']) {
-  vm.runInThisContext(fs.readFileSync(path.join(root, file), 'utf8'), { filename: file });
+  await importModule(file);
 }
-WORLD_ENGINE_STORE.setItem('memory_engine_settings', JSON.stringify({ apiAutoRetries: 3, injectIntoWorldEngine: true }));
+global.WORLD_ENGINE_STORE.setItem('memory_engine_settings', JSON.stringify({ apiAutoRetries: 3, injectIntoWorldEngine: true }));
 
 function assert(condition, message) {
   if (!condition) throw new Error(message);
