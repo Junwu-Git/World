@@ -29,7 +29,7 @@ async function testExecutionCrashDoesNotBlockMemory() {
     const APIs = {
       'world-engine-store.js': ['WORLD_ENGINE_STORE', { hydrate: async () => {}, getItem() { return null; }, setItem() {} }],
       'world-engine-core.js': ['WORLD_ENGINE_CORE', { getChatId() { return 'test'; }, loadState() { return {}; } }],
-      'world-engine-api.js': ['WORLD_ENGINE_API', { callApi: async () => '' }],
+      'world-engine-api.js': ['WORLD_ENGINE_API', { callApi: async () => '', callEmbeddings: async () => [], callRerank: async () => [] }],
       'world-engine-bridge.js': ['WORLD_ENGINE_BRIDGE', { buildBridgeSection: async () => '', buildHistorySection: async () => '' }],
       'world-engine-worldbook.js': ['WORLD_ENGINE_WORLDBOOK', { buildPromptSection: async () => '' }],
       'world-engine-chatcache.js': ['WORLD_ENGINE_CHATCACHE', { init() {} }],
@@ -43,6 +43,7 @@ async function testExecutionCrashDoesNotBlockMemory() {
       'memory-engine-settings.js': ['MEMORY_ENGINE_SETTINGS', { getSettings() { return {}; }, patchSettings() {} }],
       'memory-engine-data.js': ['MEMORY_ENGINE_DATA', { loadState() { return { personal_memory: [] }; }, saveState() {} }],
       'memory-engine-timeline.js': ['MEMORY_ENGINE_TIMELINE', { captureRange() { return []; }, auditRefs() { return { valid: true, refs: [] }; }, syncHidden() {} }],
+      'memory-engine-vector.js': ['MEMORY_ENGINE_VECTOR', { recallForGeneration: async () => null, getLastRecall() { return null; }, scheduleIndexUpdate() {}, rebuildIndex: async () => ({}), getVectorStatus() { return {}; } }],
       'memory-engine-prompt.js': ['MEMORY_ENGINE_PROMPT', { buildUserPrompt() { return ''; } }],
       'memory-engine-small-summary-prompt.js': ['MEMORY_ENGINE_SMALL_SUMMARY_PROMPT', { buildUserPrompt() { return ''; } }],
       'memory-engine-big-summary-prompt.js': ['MEMORY_ENGINE_BIG_SUMMARY_PROMPT', { buildUserPrompt() { return ''; } }],

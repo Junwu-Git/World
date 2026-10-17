@@ -74,9 +74,12 @@ window.WORLD_ENGINE_EVOLUTION = (function() {
   // [MAP] 推演 prompt 分段（全透明展示用，只读）。与实际发出的 prompt 字节级一致：
   // 各段先提成命名变量，模板字面量与 segments 数组引用同一变量，杜绝重复求值/复制漂移。
   let _lastPromptSegments = [];
+  // 输入预算裁剪记录（null = 本轮未启用预算或未超限）。裁剪发生在分段变量上，
+  // 分段镜像与实际发出自动保持一致；世界引擎据此在状态栏提示「已裁剪」。
+  let _lastPromptTrimmed = null;
 
   function getLastDebug() {
-    return { prompt: _lastPrompt, rawResult: _lastRawResult, segments: _lastPromptSegments };
+    return { prompt: _lastPrompt, rawResult: _lastRawResult, segments: _lastPromptSegments, trimmed: _lastPromptTrimmed };
   }
 
   // ========== 区域突发事件骰子系统 ==========
@@ -920,12 +923,12 @@ ${JSON.stringify(sample || [], null, 2)}
     const fullRules = rulesLoader ? rulesLoader.getAllRulesText() : '【规则加载失败】';
     // 蓝绿灯触发：扫描本扩展自己喂给推演的近期对话（解耦，不读酒馆的聊天扫描）
     const worldbookScanText = dialogueText || `${userMsg || ''}\n${aiMsg || ''}`;
-    const worldbookSection = await window.WORLD_ENGINE_WORLDBOOK?.buildPromptSection?.(worldbookScanText) || '';
-    // 用户人设（酒馆「用户设定」里的 persona 描述）：只读参照。开关关闭、人称为空、
+    let worldbookSection = await window.WORLD_ENGINE_WORLDBOOK?.buildPromptSection?.(worldbookScanText) || '';
+    // 用户人设（酒馆「用户设定」里的 persona 描述）：只读参照。人称为空、
     // 用户在酒馆把注入位置设为「不注入」或读取失败时一律为空，不阻断推演。
     let personaSection = '';
     try {
-      personaSection = await core.buildPersonaSection?.((api.getSettings ? api.getSettings() : {}).personaEnabled === true) || '';
+      personaSection = await core.buildPersonaSection?.() || '';
     } catch (error) {
       console.error('[世界引擎] 读取用户人设失败（已隔离）', error);
     }
@@ -948,7 +951,7 @@ ${JSON.stringify(sample || [], null, 2)}
       console.error('[世界引擎] 读取外部数据源桥失败（已隔离）', error);
     }
     const tonePrompt = ((api.getSettings ? api.getSettings() : {}).tonePrompt || '').trim();
-    const toneSection = tonePrompt
+    let toneSection = tonePrompt
       ? `\n\n========== 附加提示词（用户自定义 · 优先遵守 · 但不得违反上述输出 JSON 格式）==========\n${tonePrompt}`
       : '';
 
@@ -979,9 +982,77 @@ ${JSON.stringify(sample || [], null, 2)}
 
     const segDialogue = `## 近期对话\n${dialogueText ? dialogueText : `用户：${userMsg || ''}\nAI：${aiMsg || ''}`}`;
 
-    const segExtraInstruction = extraInstruction ? extraInstruction : '';
+    let segExtraInstruction = extraInstruction ? extraInstruction : '';
     // toneSection 已含前导 \n\n；segments 存原始 toneSection，与实际发出一致
-    const segToneSection = toneSection;
+    let segToneSection = toneSection;
+
+    // ===== 输入预算（可选，设置 promptBudgetChars，0 = 不限制）=====
+    // 参照段无总上限时，规则全文 + 世界书 + 桥 + 对话可能超过模型上下文：供应商要么 400
+    // 要么静默掐头，用户无从得知推演读了打折的信息。开启预算后按两步裁剪，核心段永不裁：
+    //   1) 近期对话从最旧行丢弃（最新轮语义权重最高）；
+    //   2) 仍超限 → 世界书/桥/历史摘要/记忆/人设/附加提示词等参照段等比收缩。
+    // 裁剪直接作用在拼接变量上，下方 rawPrompt 与分段镜像自动与实际发出保持一致；
+    // 字符数为近似口径（中文约 1 字 ≈ 1 token），仅作粗限流，不等价于模型上下文精确计算。
+    {
+      const budget = Math.max(0, parseInt((api.getSettings ? api.getSettings() : {}).promptBudgetChars) || 0);
+      if (budget > 0) {
+        const TRIM_MARK = '\n…【已按输入预算截断】';
+        const elastic = [];
+        const track = (key, label, get, set) => { const text = get(); if (text) elastic.push({ key, label, get, set, len: text.length }); };
+        track('dialogue', '近期对话', () => segDialogue, v => { segDialogue = v; });
+        track('worldbook', '世界书注入', () => worldbookSection, v => { worldbookSection = v; });
+        track('bridge-history', '历史剧情摘要', () => bridgeHistorySection, v => { bridgeHistorySection = v; });
+        track('bridge', '外部数据源', () => bridgeSection, v => { bridgeSection = v; });
+        track('memory-engine', '记忆引擎注入', () => memoryEngineSection, v => { memoryEngineSection = v; });
+        track('persona', '用户人设', () => personaSection, v => { personaSection = v; });
+        track('tone', '附加提示词', () => toneSection, v => { toneSection = v; segToneSection = v; });
+        const totalLen = segEngineRole.length + ENTITY_ID_PROTOCOL.length + segCausalSteps.length
+          + fullRules.length + segStateBlock.length + segOutputInstructions.length + segJsonExample.length
+          + segExtraInstruction.length + elastic.reduce((s, e) => s + e.len + 2, 0);
+        if (totalLen > budget) {
+          let over = totalLen - budget;
+          const dlg = elastic.find(e => e.key === 'dialogue');
+          let droppedLines = 0;
+          if (dlg) {
+            const HEADER = '## 近期对话\n';
+            const text = dlg.get();
+            if (text.startsWith(HEADER)) {
+              const lines = text.slice(HEADER.length).split('\n');
+              while (over > 0 && lines.length > 1) { over -= lines[0].length + 1; lines.shift(); droppedLines++; }
+              dlg.set(HEADER + lines.join('\n'));
+            } else if (over > 0) {
+              dlg.set(text.slice(0, Math.max(0, text.length - over)) + TRIM_MARK);
+              over = 0;
+            }
+          }
+          if (over > 0) {
+            const rest = elastic.filter(e => e.key !== 'dialogue');
+            const restLen = rest.reduce((s, e) => s + e.len + 2, 0);
+            if (restLen > 0) {
+              const factor = Math.max(0, (restLen - over) / restLen);
+              for (const e of rest) {
+                const keepLen = Math.floor(e.len * factor);
+                if (keepLen < e.len) e.set(e.get().slice(0, keepLen) + TRIM_MARK);
+              }
+            }
+          }
+          const trimmedSections = elastic
+            .map(e => ({ key: e.key, label: e.label, before: e.len, after: e.get().length }))
+            .filter(s => s.after !== s.before);
+          if (trimmedSections.length) {
+            _lastPromptTrimmed = { budget, totalBefore: totalLen, droppedDialogueLines: droppedLines, sections: trimmedSections };
+            console.warn('[世界引擎] 提示词超出输入预算 ' + budget + '（原 ' + totalLen + ' 字符），已裁剪：'
+              + trimmedSections.map(s => `${s.label} ${s.before}→${s.after}`).join(', '));
+          } else {
+            _lastPromptTrimmed = null;
+          }
+        } else {
+          _lastPromptTrimmed = null;
+        }
+      } else {
+        _lastPromptTrimmed = null;
+      }
+    }
 
     // [MAP] 实际发出的完整 prompt：与原模板逐字相同的拼接顺序与分隔，零语义漂移。
     // 4 段用上方的 seg*（覆写层 Final 变量）：无覆写时逐字等于原常量。
@@ -1546,6 +1617,8 @@ ${JSON.stringify(sample || [], null, 2)}
     }
   }
 
+  function getPromptTrimmed() { return _lastPromptTrimmed; }
+
   function getLastError() {
     return _lastError;
   }
@@ -1568,5 +1641,5 @@ ${JSON.stringify(sample || [], null, 2)}
     'json-example':  JSON_EXAMPLE
   };
 
-  return { evolve, backfillEvolve, getLastDebug, abort, isRunning, getLastError };
+  return { evolve, backfillEvolve, getLastDebug, abort, isRunning, getLastError, getPromptTrimmed };
 })();

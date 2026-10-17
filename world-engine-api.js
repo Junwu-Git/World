@@ -15,8 +15,24 @@ window.WORLD_ENGINE_API = (function() {
 
   function getSettings(forceRefresh) {
     if (forceRefresh) cachedSettings = null;
-    if (cachedSettings) return cachedSettings;
-    const defaults = {
+    if (!cachedSettings) {
+      cachedSettings = buildDefaults();
+      const raw = window.WORLD_ENGINE_STORE.getItem('world_engine_settings');
+      if (raw) {
+        try {
+          cachedSettings = { ...cachedSettings, ...JSON.parse(raw) };
+          if (parseInt(cachedSettings.maxTokens) === 4096) cachedSettings.maxTokens = 65000;
+        } catch(e) {}
+      }
+    }
+    // 返回副本而非缓存本体：调用方（含第三方脚本）改动返回值不能污染缓存、
+    // 也不会拿到会随后台刷新漂移的活引用。apiKey 保留在副本里——设置表单经由本函数
+    // 回显并整体回存，掩码会把真 key 写坏；key 的出机口面（诊断导出）已单独脱敏。
+    return { ...cachedSettings };
+  }
+
+  function buildDefaults() {
+    return {
       apiUrl: '',
       apiKey: '',
       model: 'gpt-3.5-turbo',
@@ -42,9 +58,6 @@ window.WORLD_ENGINE_API = (function() {
       autoBackup: false,   // 滚动自动备份：每当轮次推进，自动存一条到聊天（保留最近几条）
       worldbookTrigger: false, // 世界书蓝绿灯触发：🔵常驻恒注入 / 🟢关键词命中才注入（默认关闭=全部已选注入）
       worldbookEjsRender: false, // 世界书条目 EJS 渲染：展开 {{宏}} 并执行 <% %> 模板（默认关闭=原文注入）
-      // 用户人设参照：把酒馆「用户设定」里的 persona 描述只读喂给推演 prompt（默认关闭）。
-      // 酒馆里把人设注入位置设为「不注入」时，即使本开关打开也不注入。
-      personaEnabled: false,
       // 批量重填世界推演：从第 1 个 AI 楼层分批推到指定楼层（清空重来）
       backfillBatchSize: 5,    // 每批 AI 楼层数（每多少层调一次推演）
       backfillRetries: 2,      // 每批独立重试次数（推演失败时重试上限）
@@ -54,6 +67,9 @@ window.WORLD_ENGINE_API = (function() {
       manualReadRounds: 1,
       // 推演上下文读取模式：'rounds'=按轮（读最近 a 轮，默认，旧行为）；'visible'=可见层（全部未隐藏楼层）
       contextMode: 'rounds',
+      // 输入预算（字符，近似口径）：0 = 不限制（默认，旧行为）。>0 时推演 prompt 超限
+      // 按弹性段裁剪（近期对话丢最旧行 → 参照段等比收缩），并在状态栏提示「已裁剪」。
+      promptBudgetChars: 0,
       evolveFilterRegex: '',
       tonePrompt: '',
       // 按时间推演模式
@@ -114,16 +130,16 @@ window.WORLD_ENGINE_API = (function() {
       //   直到用户切一次聊天才解锁。超时让挂起请求按失败处理，finally 正常复位。
       apiTimeoutMs: 120000
     };
-    const raw = window.WORLD_ENGINE_STORE.getItem('world_engine_settings');
-    if (raw) {
-      try {
-        cachedSettings = { ...defaults, ...JSON.parse(raw) };
-        if (parseInt(cachedSettings.maxTokens) === 4096) cachedSettings.maxTokens = 65000;
-        return cachedSettings;
-      } catch(e) {}
-    }
-    cachedSettings = defaults;
-    return cachedSettings;
+  }
+
+  // 设置唯一写入路径：合并补丁 → 落库 → 刷新缓存，返回合并后的副本。
+  // 旧实现 8 处散落「读当前→合并→setItem→getSettings(true) 失效」四连，漏掉末步就读到旧缓存；
+  // 收敛后写完即可安全 getSettings()。设置表单整对象回存也走这里（补丁里带全量字段）。
+  function patchSettings(patch) {
+    const next = { ...getSettings(true), ...(patch || {}) };
+    window.WORLD_ENGINE_STORE.setItem('world_engine_settings', JSON.stringify(next));
+    cachedSettings = next;
+    return { ...next };
   }
 
   // [FIX] 规整 chat/completions URL：只补 /chat/completions，不再替用户塞 /v1 等版本前缀。
@@ -334,6 +350,81 @@ window.WORLD_ENGINE_API = (function() {
     return choice.message?.content || '';
   }
 
+  // 向量子系统端点推导：chat/completions URL 剥掉尾段后接 /embeddings 或 /rerank。
+  function vectorEndpointUrl(configuredUrl, fallbackUrl, suffix) {
+    const source = String(configuredUrl || fallbackUrl || '').trim();
+    if (!source) return '';
+    let u = source.trim().replace(/\/+$/, '');
+    if (u.endsWith(suffix)) return u;
+    u = u.replace(/\/chat\/completions$/, '');
+    return u + suffix;
+  }
+
+  function vectorAuthHeaders(settings, override) {
+    const headers = { 'Content-Type': 'application/json' };
+    const pick = value => String(value == null ? '' : value).trim();
+    const key = pick(override?.vectorApiKey) || pick(settings?.vectorApiKey) || pick(override?.apiKey) || pick(settings?.apiKey);
+    if (key) headers['Authorization'] = 'Bearer ' + key;
+    return headers;
+  }
+
+  // OpenAI 兼容 /embeddings：兼容 data[].embedding 为数组或 base64 float32 两种返回。
+  // 仅支持直连——酒馆代理只透传 chat/completions，没有 embeddings 通道。
+  async function callEmbeddings(texts, signal, settingsOverride) {
+    const settings = settingsOverride || getSettings();
+    if (settings.connectionMode === 'proxy') {
+      throw new Error('向量端点仅支持直连：酒馆代理没有 /embeddings 转发通道，请把连接方式改为直连');
+    }
+    const url = vectorEndpointUrl(settings.vectorApiUrl, settings.apiUrl, '/embeddings');
+    if (!url) throw new Error('未配置向量端点 URL');
+    const body = { model: settings.vectorModel, input: Array.isArray(texts) ? texts : [texts] };
+    const result = await fetchResponseWithTimeout(url, {
+      method: 'POST',
+      headers: vectorAuthHeaders(settings, settingsOverride),
+      body: JSON.stringify(body)
+    }, signal, settings.apiTimeoutMs);
+    if (!result.resp.ok) throw new Error(`HTTP ${result.resp.status}: ${responseDetail(result)}`);
+    const data = requireJson(result, '向量端点');
+    const list = Array.isArray(data?.data) ? data.data : [];
+    if (list.length !== body.input.length) throw new Error('向量端点返回条数与请求不一致');
+    return list.map(item => {
+      const embedding = item?.embedding;
+      if (Array.isArray(embedding)) return Float32Array.from(embedding.map(Number));
+      if (typeof embedding === 'string' && embedding) {
+        const binary = atob(embedding);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+        return new Float32Array(bytes.buffer, bytes.byteOffset, Math.floor(bytes.byteLength / 4));
+      }
+      throw new Error('向量端点返回了无法识别的向量格式');
+    });
+  }
+
+  // Jina/Cohere 风格 /rerank：返回按相关性降序的 {index, score} 列表。
+  async function callRerank(query, documents, signal, settingsOverride) {
+    const settings = settingsOverride || getSettings();
+    if (settings.connectionMode === 'proxy') {
+      throw new Error('重排端点仅支持直连：酒馆代理没有 /rerank 转发通道');
+    }
+    const url = vectorEndpointUrl(settings.vectorRerankUrl, settings.vectorApiUrl || settings.apiUrl, '/rerank');
+    if (!url) throw new Error('未配置重排端点 URL');
+    const docs = Array.isArray(documents) ? documents : [documents];
+    const body = { model: settings.vectorRerankModel, query, documents: docs, top_n: docs.length };
+    const result = await fetchResponseWithTimeout(url, {
+      method: 'POST',
+      headers: vectorAuthHeaders(settings, settingsOverride),
+      body: JSON.stringify(body)
+    }, signal, settings.apiTimeoutMs);
+    if (!result.resp.ok) throw new Error(`HTTP ${result.resp.status}: ${responseDetail(result)}`);
+    const data = requireJson(result, '重排端点');
+    const list = Array.isArray(data?.results) ? data.results : (Array.isArray(data?.data) ? data.data : []);
+    return list.map(item => ({
+      index: Number(item?.index),
+      score: Number(item?.relevance_score ?? item?.score ?? 0)
+    })).filter(item => Number.isInteger(item.index) && item.index >= 0 && item.index < docs.length)
+      .sort((a, b) => b.score - a.score);
+  }
+
   function repairTruncatedJSON(content) {
     const rootStart = content.indexOf('{');
     if (rootStart === -1) return null;
@@ -460,5 +551,5 @@ window.WORLD_ENGINE_API = (function() {
     throw new Error('无法解析模型列表');
   }
 
-  return { callApi, parseJSON, getSettings, fetchModelList };
+  return { callApi, callEmbeddings, callRerank, parseJSON, getSettings, patchSettings, fetchModelList };
 })();

@@ -9,6 +9,7 @@ window.MEMORY_ENGINE = (function() {
   let runningLabel = '';
   let abortController = null, autoTimer = null, lastEventKey = '';
   let hiddenSyncPromise = Promise.resolve();
+  let vectorRecallPromise = Promise.resolve();
   let lastDebug = { prompt: '', rawResult: '', parsed: null, error: '' };
   let backfillStatus = { running: false, current: 0, total: 0, message: '' };
   let summaryBackfillStatus = { running: false, current: 0, total: 0, message: '' };
@@ -17,6 +18,11 @@ window.MEMORY_ENGINE = (function() {
   const clean = v => String(v == null ? '' : v).trim();
   const unique = list => Array.from(new Set((list || []).map(clean).filter(Boolean)));
   const normalized = v => clean(v).toLocaleLowerCase();
+  // 相对时间词不能原样入库：绝对时间缺失时宁可为空，也不让「昨天」这类词随故事推进失效。
+  const RELATIVE_TIME_RE = /^(昨晚|昨天|三天前|刚才|不久前|宴会之后)$/;
+  // 总述压缩深度上限：1=纪要合并，2=更早总述，3=最早总述。
+  const MAX_SUMMARY_LEVEL = 3;
+  const SUMMARY_LEVEL_LABELS = { 2: '更早总述', 3: '最早总述' };
   const settings = () => window.MEMORY_ENGINE_SETTINGS?.getSettings(true) || {};
   const data = () => window.MEMORY_ENGINE_DATA;
   const timelineApi = () => window.MEMORY_ENGINE_TIMELINE;
@@ -105,9 +111,73 @@ window.MEMORY_ENGINE = (function() {
     };
   }
 
-  function extractStoryTime(text) {
+  // 『』时间标签是外部约定（模型/世界书写进正文），本引擎只消费。
+  // 取批内首个与末个标签作为起止区间；仅一个标签时起止相同。
+  function extractStoryTimeRange(text) {
     const found = Array.from(String(text || '').matchAll(/『([^』]*(?:年|月|日|时|刻)[^』]*)』/g));
-    return found.length ? clean(found.at(-1)[1].split('丨').slice(0, 3).join(' ')) : '';
+    const format = value => clean(value.split('丨').slice(0, 3).join(' '));
+    if (!found.length) return { start: '', end: '' };
+    const start = format(found[0][1]);
+    return { start, end: format(found.at(-1)[1]) };
+  }
+
+  function extractStoryTime(text) {
+    const range = extractStoryTimeRange(text);
+    return range.end || range.start;
+  }
+
+  // 纪要/总述起止时间的来源优先级：模型字段 → 正文『』标签 → 子条目继承。
+  // start 与 end 相同是合法值（单轮次）；时间以文本透传，架空纪年也允许。
+  function resolveSummaryTimes(llmStart, llmEnd, conversationText, children) {
+    const range = extractStoryTimeRange(conversationText);
+    const childStart = (children || []).map(item => clean(item?.timeStart)).find(Boolean) || '';
+    const childEnd = (children || []).map(item => clean(item?.timeEnd)).filter(Boolean).at(-1) || '';
+    return {
+      timeStart: sanitizeTime(llmStart) || range.start || childStart,
+      timeEnd: sanitizeTime(llmEnd) || range.end || childEnd
+    };
+  }
+
+  // 纪要/总述的绝对时间区间：起止不同用「至」连接，否则单值；未知返回空串。
+  function formatSummaryTimeRange(item) {
+    const start = clean(item?.timeStart), end = clean(item?.timeEnd);
+    if (start && end && normalized(start) !== normalized(end)) return `${start} 至 ${end}`;
+    return start || end;
+  }
+
+  // 参考上下文用绝对时间；无时间回退楼层号（楼层号仅供人工对源，模型无法从中读出时间）。
+  function formatSummaryRefLabel(item) {
+    return formatSummaryTimeRange(item) || `楼层 ${Number(item?.startLayer) || 0}-${Number(item?.endLayer) || 0}`;
+  }
+
+  // 故事内「现在」：聊天末尾能解析到的最新故事时间（y*360+m*30+d 虚算法，与推演阈值同一口径）。
+  function latestStoryDayTotal() {
+    const nowDay = window.WORLD_ENGINE?.parseLatestStoryDay?.(chat());
+    const total = Number(nowDay?.total);
+    return Number.isFinite(total) ? total : null;
+  }
+
+  // 相对距离前缀只在注入层使用：起止时间与故事内现在都能解析为数字日期时才标注，
+  // 架空纪年解析不了就不标（宁缺毋错）。
+  function formatRelativeStoryAge(item, nowTotal) {
+    const parse = window.WORLD_ENGINE_CORE?.parseStoryDate;
+    if (typeof parse !== 'function' || !Number.isFinite(Number(nowTotal))) return '';
+    const anchor = parse(clean(item?.timeEnd)) || parse(clean(item?.timeStart));
+    if (!anchor || !Number.isFinite(Number(anchor.total))) return '';
+    const diff = Number(nowTotal) - Number(anchor.total);
+    if (diff < 0) return '';
+    if (diff <= 1) return '最近';
+    if (diff < 30) return `约 ${Math.round(diff)} 天前`;
+    if (diff < 360) return `约 ${Math.round(diff / 30)} 个月前`;
+    return `约 ${Math.round(diff / 360)} 年前`;
+  }
+
+  // 注入行标注：时间优先，相对前缀叠加在绝对时间前；无时间回退楼层号。
+  function formatSummaryLabel(item, nowTotal) {
+    const range = formatSummaryTimeRange(item);
+    if (!range) return formatSummaryRefLabel(item);
+    const relative = formatRelativeStoryAge(item, nowTotal);
+    return relative ? `${relative} · ${range}` : range;
   }
 
   function filterConversation(conversation, st) {
@@ -170,10 +240,10 @@ window.MEMORY_ENGINE = (function() {
     const historyBigSummaries = bigCount ? eligibleBig.slice(-bigCount) : [];
     const parts = [];
     if (historyBigSummaries.length) parts.push(`【更早总述】\n${historyBigSummaries.map((item, index) =>
-      `${index + 1}. [楼层 ${Number(item?.startLayer) || 0}-${Number(item?.endLayer) || 0}] ${clean(item?.content)}`
+      `${index + 1}. [${formatSummaryRefLabel(item)}] ${clean(item?.content)}`
     ).join('\n')}`);
     if (historySmallSummaries.length) parts.push(`【前置纪要】\n${historySmallSummaries.map((item, index) =>
-      `${index + 1}. [楼层 ${Number(item?.startLayer) || 0}-${Number(item?.endLayer) || 0}] ${clean(item?.content)}`
+      `${index + 1}. [${formatSummaryRefLabel(item)}] ${clean(item?.content)}`
     ).join('\n')}`);
     if (raw.conversation) parts.push(`【近期正文】\n${filterConversation(raw.conversation, st)}`);
     return { historyBigSummaries, historySmallSummaries, raw, text: parts.join('\n\n') };
@@ -188,14 +258,33 @@ window.MEMORY_ENGINE = (function() {
     };
   }
 
+  // 既有记忆作对照喂给提取任务：落库去重只认全文字符串，模型换一种措辞就会重复入库，
+  // 因此在请求里明示已记录的内容。每人取最近 8 条、最多 8 人，防止长对话把 prompt 撑爆。
+  function collectExistingMemories(state) {
+    const characters = [];
+    for (const character of state.personal_memory || []) {
+      const names = unique(character.names || []);
+      if (!names.length) continue;
+      const records = [];
+      for (const memories of Object.values(character.memory || {})) {
+        for (const memory of Array.isArray(memories) ? memories : []) {
+          const text = clean(memory);
+          if (text) records.push(text);
+        }
+      }
+      if (records.length) characters.push({ label: names.join(' / '), records: records.slice(-8) });
+    }
+    return characters.slice(-8);
+  }
+
   async function buildRequestPrompt(tasks, state, st) {
     const segments = [];
     // 用户人设（酒馆「用户设定」里的 persona 描述）：只读参照，只进人物/实体提取任务
-    // （known_by 归属、用户作为知情人物等判定需要知道{{user}}是谁）。开关关闭、人称为空、
+    // （known_by 归属、用户作为知情人物等判定需要知道{{user}}是谁）。人称为空、
     // 用户在酒馆把注入位置设为「不注入」或读取失败时一律为空，不阻断提取。
     if (tasks.memory) {
       try {
-        const personaSection = await window.WORLD_ENGINE_CORE?.buildPersonaSection?.(st.personaEnabled === true) || '';
+        const personaSection = await window.WORLD_ENGINE_CORE?.buildPersonaSection?.() || '';
         if (personaSection) segments.push(personaSection);
       } catch (error) {
         console.error('[记忆引擎] 读取用户人设失败（已隔离）', error);
@@ -217,8 +306,18 @@ window.MEMORY_ENGINE = (function() {
         currentStoryTime: extractStoryTime(filtered),
         knownPeople: (state.personal_memory || []).map(character => unique(character.names)),
         knownEntities: ENTITY_TYPES.flatMap(type => (state.entity_memory?.[type] || []).map(entity => ({
-          type: ENTITY_LABELS[type], name: entity.name, aliases: unique(entity.aliases), description: entity.description
+          type: ENTITY_LABELS[type], name: entity.name, aliases: unique(entity.aliases), description: entity.description,
+          history: Array.isArray(entity.history) ? entity.history.slice(-5) : []
         }))),
+        knownNpcProfiles: tasks.memory ? (state.npc_profiles || [])
+          .filter(profile => clean(profile.location) || clean(profile.condition) || clean(profile.stance))
+          .slice(-8).map(profile => ({
+            names: unique(profile.names || []),
+            location: clean(profile.location),
+            condition: clean(profile.condition),
+            stance: clean(profile.stance)
+          })) : [],
+        existingMemories: tasks.memory ? collectExistingMemories(state) : [],
         worldbook,
         referenceContext: memoryReference?.text || '',
         conversation: filtered
@@ -228,6 +327,7 @@ window.MEMORY_ENGINE = (function() {
     if (tasks.small) {
       segments.push(`【任务说明】\n${window.MEMORY_ENGINE_SMALL_SUMMARY_PROMPT.SYSTEM_PROMPT}\n\n${window.MEMORY_ENGINE_SMALL_SUMMARY_PROMPT.buildUserPrompt({
         ...tasks.small,
+        currentStoryTime: extractStoryTime(filterConversation(tasks.small.conversation, st)),
         reuseConversation: sharesReference,
         referenceContext: sharesReference && memoryReference?.text
           ? '沿用同一请求前文人物/实体任务中的【只读辅助参考】，不得把其中旧内容写成本段新增事件。'
@@ -258,8 +358,16 @@ window.MEMORY_ENGINE = (function() {
       "time": "这条事件对应的绝对故事时间或空字符串"
     }
   ]`);
-    if (tasks.small) fields.push('"small_summary": ""');
-    if (tasks.big) fields.push('"big_summary": ""');
+    if (tasks.memory && tasks.memory.kind !== 'world_link') fields.push(`"npc_updates": [
+    {
+      "names": ["人物名或别名"],
+      "location": "所在位置或空字符串",
+      "condition": "当前处境或空字符串",
+      "stance": "对主角的外在态度或空字符串"
+    }
+  ]`);
+    if (tasks.small) fields.push('"small_summary": "", "time_start": "", "time_end": ""');
+    if (tasks.big) fields.push('"big_summary": "", "time_start": "", "time_end": ""');
     const tone = clean(st.tonePrompt);
     const emptyMemory = tasks.memory
       ? '\n\n没有对应内容时分别使用 "personal_memory": [] 和 "entity_updates": []；不得省略字段。'
@@ -267,18 +375,87 @@ window.MEMORY_ENGINE = (function() {
     return `${segments.join('\n\n=====\n\n')}\n\n【统一输出要求】\n只输出一个合法 JSON 对象，不要输出 Markdown、代码围栏或解释。严格按照以下完整结构返回；模板文字替换为实际内容：\n{\n  ${fields.join(',\n  ')}\n}${emptyMemory}${tone ? `\n\n【附加要求】\n${tone}` : ''}`;
   }
 
-  function parseResponse(raw, tasks) {
-    const text = clean(raw).replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '');
-    let value;
-    try { value = JSON.parse(text); }
-    catch (_) {
-      const objectStart = text.indexOf('{'), objectEnd = text.lastIndexOf('}');
-      const arrayStart = text.indexOf('['), arrayEnd = text.lastIndexOf(']');
-      if (arrayStart >= 0 && arrayStart < objectStart && arrayEnd > arrayStart) value = JSON.parse(text.slice(arrayStart, arrayEnd + 1));
-      else if (objectStart >= 0 && objectEnd > objectStart) value = JSON.parse(text.slice(objectStart, objectEnd + 1));
-      else if (arrayStart >= 0 && arrayEnd > arrayStart) value = JSON.parse(text.slice(arrayStart, arrayEnd + 1));
-      else throw new Error('API 返回中没有合法 JSON 对象或数组');
+  // 思维链剥离：成对标签整段删除；只剩闭合标签说明前面是未完成草稿，丢弃到最后一个闭合标签为止；
+  // 只剩开标签说明输出被截断，从开标签起整体作废。
+  function stripThinking(text) {
+    let value = String(text || '').replace(/<(?:think|thinking)>[\s\S]*?<\/(?:think|thinking)>/gi, '');
+    const closes = value.match(/<\/(?:think|thinking)>/gi);
+    if (closes?.length) {
+      const lastClose = value.toLowerCase().lastIndexOf(closes.at(-1).toLowerCase());
+      value = value.slice(lastClose + closes.at(-1).length);
+    } else {
+      const openMatch = value.match(/<(?:think|thinking)>/i);
+      if (openMatch) value = value.slice(0, value.toLowerCase().indexOf(openMatch[0].toLowerCase()));
     }
+    return value.trim();
+  }
+
+  function normalizeJsonText(text) {
+    return String(text || '')
+      .replace(/[“”]/g, '"').replace(/[‘’]/g, "'")
+      .replace(/,\s*([}\]])/g, '$1');
+  }
+
+  // 字符串内部的野引号（如英文对白）补转义：串内引号只有后继是结构性字符才算结束引号。
+  // 对已合法的 JSON 是恒等变换。
+  function escapeStrayQuotes(text) {
+    const source = String(text || '');
+    let result = '', inString = false, escaped = false;
+    for (let i = 0; i < source.length; i++) {
+      const ch = source[i];
+      if (!inString) {
+        if (ch === '"') inString = true;
+        result += ch;
+        continue;
+      }
+      if (escaped) { escaped = false; result += ch; continue; }
+      if (ch === '\\') { escaped = true; result += ch; continue; }
+      if (ch === '"') {
+        let j = i + 1;
+        while (j < source.length && /\s/.test(source[j])) j++;
+        const next = j < source.length ? source[j] : '';
+        if (next === '' || ':,}]'.includes(next)) { inString = false; result += ch; }
+        else result += '\\"';
+        continue;
+      }
+      result += ch;
+    }
+    return result;
+  }
+
+  function extractJsonPayload(raw) {
+    const text = stripThinking(clean(raw)).replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '');
+    const candidates = [];
+    const push = value => { if (value && !candidates.includes(value)) candidates.push(value); };
+    push(text.trim());
+    const objectStart = text.indexOf('{'), objectEnd = text.lastIndexOf('}');
+    const arrayStart = text.indexOf('['), arrayEnd = text.lastIndexOf(']');
+    if (arrayStart >= 0 && arrayStart < objectStart && arrayEnd > arrayStart) push(text.slice(arrayStart, arrayEnd + 1));
+    else if (objectStart >= 0 && objectEnd > objectStart) push(text.slice(objectStart, objectEnd + 1));
+    else if (arrayStart >= 0 && arrayEnd > arrayStart) push(text.slice(arrayStart, arrayEnd + 1));
+    for (const candidate of candidates) {
+      for (const prepared of [candidate, normalizeJsonText(candidate), escapeStrayQuotes(candidate),
+        escapeStrayQuotes(normalizeJsonText(candidate))]) {
+        try { return JSON.parse(prepared); } catch (_) { /* 尝试下一级清洗 */ }
+      }
+    }
+    throw new Error('API 返回中没有合法 JSON 对象或数组');
+  }
+
+  // 超长条目在限制内就近按句读截断，避免模型超字数时把残句写进记录。
+  function clampSentence(value, limit) {
+    const text = clean(value);
+    if (text.length <= limit) return text;
+    const truncated = text.slice(0, limit);
+    const cut = Math.max(
+      truncated.lastIndexOf('。'), truncated.lastIndexOf('！'), truncated.lastIndexOf('？'),
+      truncated.lastIndexOf('；'), truncated.lastIndexOf('，')
+    );
+    return cut >= Math.ceil(limit / 2) ? truncated.slice(0, cut + 1) : truncated;
+  }
+
+  function parseResponse(raw, tasks) {
+    const value = extractJsonPayload(raw);
     const nameBlacklist = configuredNameBlacklist(settings());
     // 兼容 0.1.x：旧 API 只返回人物记忆数组。
     const personalValue = tasks.memory ? (Array.isArray(value)
@@ -291,13 +468,13 @@ window.MEMORY_ENGINE = (function() {
     for (const item of personalSource) {
       if (!item || typeof item !== 'object') continue;
       if (nameIsBlacklisted(item.name, nameBlacklist)) continue;
-      const names = unique(Array.isArray(item.name) ? item.name : [item.name]), memory = clean(item.memory);
+      const names = unique(Array.isArray(item.name) ? item.name : [item.name]), memory = clampSentence(item.memory, 50);
       if (!names.length || !memory) continue;
       const holder = normalized(names[0]), count = counts.get(holder) || 0;
       if (count >= 3) continue;
       counts.set(holder, count + 1);
       let time = clean(item.time);
-      if (/^(昨晚|昨天|三天前|刚才|不久前|宴会之后)$/.test(time)) time = '';
+      if (RELATIVE_TIME_RE.test(time)) time = '';
       personal.push({
         name: names,
         known_by: unique(Array.isArray(item.known_by) ? item.known_by : [item.known_by])
@@ -321,7 +498,7 @@ window.MEMORY_ENGINE = (function() {
       const aliases = unique(Array.isArray(item.aliases) ? item.aliases : [item.aliases]);
       if (nameIsBlacklisted([item.name, ...aliases], nameBlacklist)) continue;
       if (!ENTITY_TYPES.includes(item.type)) continue;
-      const type = item.type, name = clean(item.name), description = clean(item.description), event = clean(item.event);
+      const type = item.type, name = clean(item.name), description = clampSentence(item.description, 200), event = clean(item.event);
       if (!name) continue;
       const cleanAliases = aliases.filter(alias => normalized(alias) !== normalized(name));
       const key = `${type}:${normalized(name)}`, count = perEntityCounts.get(key) || 0;
@@ -330,20 +507,46 @@ window.MEMORY_ENGINE = (function() {
       entities[type].push({ name, aliases: cleanAliases, description, event, time: event ? sanitizeTime(item.time) : '' });
       entityUpdateCount++;
     }
-    let smallSummary = '';
+    let smallSummary = '', smallTimeStart = '', smallTimeEnd = '';
     if (tasks.small) {
       smallSummary = Array.isArray(value) ? '' : clean(value?.small_summary);
+      smallTimeStart = clampSentence(sanitizeTime(value?.time_start), 40);
+      smallTimeEnd = clampSentence(sanitizeTime(value?.time_end), 40);
     }
-    let bigSummary = '';
+    let bigSummary = '', bigTimeStart = '', bigTimeEnd = '';
     if (tasks.big) {
       bigSummary = Array.isArray(value) ? '' : clean(value?.big_summary);
+      bigTimeStart = clampSentence(sanitizeTime(value?.time_start), 40);
+      bigTimeEnd = clampSentence(sanitizeTime(value?.time_end), 40);
     }
-    return { personal, entities, smallSummary, bigSummary };
+    // 人物状态更新：只走普通提取任务；世界联动的合成输入不带 npc_updates。
+    const npcs = [];
+    if (tasks.memory && tasks.memory.kind !== 'world_link') {
+      const npcSource = Array.isArray(value) ? [] : value?.npc_updates;
+      const npcList = Array.isArray(npcSource) ? npcSource : (npcSource && typeof npcSource === 'object' ? [npcSource] : []);
+      const seenNpc = new Set();
+      for (const item of npcList) {
+        if (npcs.length >= 6) break;
+        if (!item || typeof item !== 'object') continue;
+        const names = unique(Array.isArray(item.names) ? item.names : [item.names]);
+        if (!names.length || nameIsBlacklisted(names, nameBlacklist)) continue;
+        const key = names.map(normalized).sort().join('|');
+        if (seenNpc.has(key)) continue;
+        seenNpc.add(key);
+        npcs.push({
+          names,
+          location: clampSentence(item.location, 60),
+          condition: clampSentence(item.condition, 60),
+          stance: clampSentence(item.stance, 60)
+        });
+      }
+    }
+    return { personal, entities, npcs, smallSummary, smallTimeStart, smallTimeEnd, bigSummary, bigTimeStart, bigTimeEnd };
   }
 
   function sanitizeTime(value) {
     const time = clean(value);
-    return /^(昨晚|昨天|三天前|刚才|不久前|宴会之后)$/.test(time) ? '' : time;
+    return RELATIVE_TIME_RE.test(time) ? '' : time;
   }
 
   function nextCharacterId(state) {
@@ -532,6 +735,41 @@ window.MEMORY_ENGINE = (function() {
     return added;
   }
 
+  function nextNpcProfileId(state) {
+    const max = (state.npc_profiles || []).reduce((number, profile) => {
+      const match = /^npc_(\d+)$/.exec(clean(profile.id));
+      return Math.max(number, match ? Number(match[1]) : 0);
+    }, 0);
+    return `npc_${String(max + 1).padStart(6, '0')}`;
+  }
+
+  function findNpcProfile(state, names) {
+    const wanted = new Set(unique(names).map(normalized));
+    return (state.npc_profiles || []).find(profile => (profile.names || []).some(name => wanted.has(normalized(name))));
+  }
+
+  // 人物当前状态合并：按 names 找到即逐字段非空覆盖（最新观察优先），找不到新建。
+  function mergeNpcProfiles(state, updates) {
+    if (!Array.isArray(state.npc_profiles)) state.npc_profiles = [];
+    let changed = 0;
+    for (const item of updates || []) {
+      const names = unique(item?.names);
+      if (!names.length) continue;
+      let profile = findNpcProfile(state, names);
+      if (!profile) {
+        profile = { id: nextNpcProfileId(state), names: [], location: '', condition: '', stance: '', sourceDigest: '' };
+        state.npc_profiles.push(profile);
+        changed++;
+      }
+      profile.names = unique([...(profile.names || []), ...names]);
+      for (const field of ['location', 'condition', 'stance']) {
+        const value = clean(item?.[field]);
+        if (value && profile[field] !== value) { profile[field] = value; changed++; }
+      }
+    }
+    return changed;
+  }
+
   function replaceKnownByRecords(state, ownerId, records) {
     if (!state || typeof state !== 'object') return state;
     if (!state.knowledge_index || typeof state.knowledge_index !== 'object' || Array.isArray(state.knowledge_index)) state.knowledge_index = {};
@@ -563,6 +801,11 @@ window.MEMORY_ENGINE = (function() {
     if (!Array.isArray(state.event_memory.small_summaries)) state.event_memory.small_summaries = [];
     if (!Array.isArray(state.event_memory.big_summaries)) {
       state.event_memory.big_summaries = state.event_memory.big_summary?.content ? [state.event_memory.big_summary] : [];
+    }
+    // level 1 = 纪要合并的总述；2 = 更早总述；3 = 最早总述。旧数据与非法值一律按 1。
+    for (const overview of state.event_memory.big_summaries) {
+      overview.level = Number(overview?.level) >= 2 && Number(overview?.level) <= MAX_SUMMARY_LEVEL
+        ? Number(overview.level) : 1;
     }
     delete state.event_memory.big_summary;
     if (!Number.isFinite(Number(state.event_memory.big_summary_cursor))) state.event_memory.big_summary_cursor = 0;
@@ -653,6 +896,7 @@ window.MEMORY_ENGINE = (function() {
       sourceDigest: digest,
       personal: clone(extracted?.personal || []),
       entities: clone(extracted?.entities || {}),
+      npcs: clone(extracted?.npcs || []),
       status: 'valid',
       revision: 1,
       createdAt: Date.now(),
@@ -691,6 +935,21 @@ window.MEMORY_ENGINE = (function() {
     const affectedBig = eventMemory.big_summaries.filter(item =>
       (item?.childIds || []).some(id => removedSmallIds.has(clean(id)))
     );
+    // 被撤销总述所归属的更高层总述逐层级联撤销（不动点），避免上层继续引用不存在的子总述。
+    const removedBigIds = new Set(affectedBig.map(item => clean(item?.id)));
+    let cascadeGrew = true;
+    while (cascadeGrew) {
+      cascadeGrew = false;
+      for (const overview of eventMemory.big_summaries) {
+        const id = clean(overview?.id);
+        if (!id || removedBigIds.has(id)) continue;
+        if ((overview?.childIds || []).some(childId => removedBigIds.has(clean(childId)))) {
+          removedBigIds.add(id);
+          cascadeGrew = true;
+        }
+      }
+    }
+    const affectedMeta = eventMemory.big_summaries.filter(item => removedBigIds.has(clean(item?.id)));
     const affectedChildIds = new Set([
       ...removedSmallIds,
       ...affectedBig.flatMap(item => item?.childIds || []).map(clean).filter(Boolean)
@@ -699,7 +958,8 @@ window.MEMORY_ENGINE = (function() {
 
     timeline.nodes = timeline.nodes.filter(node => !matchesNode(node));
     eventMemory.small_summaries = eventMemory.small_summaries.filter(item => !matchesSmall(item));
-    eventMemory.big_summaries = eventMemory.big_summaries.filter(item => !affectedBig.includes(item));
+    eventMemory.big_summaries = eventMemory.big_summaries
+      .filter(item => !affectedBig.includes(item) && !affectedMeta.includes(item));
     if (firstAffectedIndex >= 0) {
       eventMemory.big_summary_cursor = Math.min(eventMemory.big_summary_cursor, firstAffectedIndex);
     }
@@ -711,7 +971,7 @@ window.MEMORY_ENGINE = (function() {
       sourceKey,
       removedNodeIds: removedNodes.map(node => node.id),
       removedSmallIds: [...removedSmallIds],
-      removedBigIds: affectedBig.map(item => item.id)
+      removedBigIds: [...affectedBig, ...affectedMeta].map(item => item.id)
     };
   }
 
@@ -722,6 +982,7 @@ window.MEMORY_ENGINE = (function() {
       knowledge_index: clone(root.knowledge_index || {}),
       entity_memory: clone(root.entity_memory || {}),
       entity_index: clone(root.entity_index || {}),
+      npc_profiles: clone(root.npc_profiles || []),
       round: Math.max(0, Number(root.round) || 0),
       chatLayer: root.chatLayer ?? null,
       event_memory: clone(state.event_memory || {}),
@@ -736,6 +997,7 @@ window.MEMORY_ENGINE = (function() {
         derived.knowledge_index = clone(node.snapshot.knowledge_index || {});
         derived.entity_memory = clone(node.snapshot.entity_memory || {});
         derived.entity_index = clone(node.snapshot.entity_index || {});
+        derived.npc_profiles = clone(node.snapshot.npc_profiles || []);
         derived.round = Math.max(derived.round, Number(node.snapshot.round) || 0);
         derived.chatLayer = node.snapshot.chatLayer ?? derived.chatLayer;
         ensureEntityState(derived);
@@ -743,6 +1005,7 @@ window.MEMORY_ENGINE = (function() {
       }
       mergeMemories(derived, clone(node.personal || []));
       mergeEntityMemories(derived, clone(node.entities || {}));
+      mergeNpcProfiles(derived, clone(node.npcs || []));
       derived.round += 1;
       if (Number.isFinite(Number(node.endLayer))) derived.chatLayer = Number(node.endLayer);
     }
@@ -756,7 +1019,8 @@ window.MEMORY_ENGINE = (function() {
       personal_memory: state.personal_memory || [],
       knowledge_index: state.knowledge_index || {},
       entity_memory: state.entity_memory || {},
-      entity_index: state.entity_index || {}
+      entity_index: state.entity_index || {},
+      npc_profiles: state.npc_profiles || []
     });
     if (memoryView(nextState) === memoryView(previousState)) return nextState;
     const timeline = ensureTimelineState(previousState), api = timelineApi();
@@ -766,6 +1030,7 @@ window.MEMORY_ENGINE = (function() {
       knowledge_index: clone(nextState.knowledge_index || {}),
       entity_memory: clone(nextState.entity_memory || {}),
       entity_index: clone(nextState.entity_index || {}),
+      npc_profiles: clone(nextState.npc_profiles || []),
       round: Math.max(0, Number(nextState.round) || 0),
       chatLayer: nextState.chatLayer ?? layer
     };
@@ -797,10 +1062,12 @@ window.MEMORY_ENGINE = (function() {
     if (!memoryData) return null;
     const state = memoryData.loadState();
     const eventMemory = ensureEventState(state);
-    if (eventMemory.small_summary_layer !== null
-      && eventMemory.small_summary_layer !== ''
-      && Number.isFinite(Number(eventMemory.small_summary_layer))) return state;
-    eventMemory.small_summary_layer = chat().length - 1;
+    const storedLayer = Number(eventMemory.small_summary_layer);
+    // 聊天未就绪（0 条消息）时不落基线：写入 -1 会让后续判断永远视为已初始化。
+    const chatLength = chat().length;
+    if (chatLength <= 0) return state;
+    if (Number.isFinite(storedLayer) && storedLayer >= 0) return state;
+    eventMemory.small_summary_layer = chatLength - 1;
     return memoryData.saveState(state);
   }
 
@@ -873,6 +1140,7 @@ window.MEMORY_ENGINE = (function() {
       const entityChanges = applyMemory
         ? mergeEntityMemories(next, extracted.entities)
         : { entities: 0, history: 0, descriptions: 0 };
+      const npcChanges = applyMemory ? mergeNpcProfiles(next, extracted.npcs) : 0;
       if (applyMemory) appendTimelineNode(next, extracted, tasks.memory, options);
       const eventMemory = ensureEventState(next);
       let addedSmall = 0, updatedBig = 0;
@@ -888,6 +1156,7 @@ window.MEMORY_ENGINE = (function() {
             startLayer: Number(tasks.small.startLayer) || 0,
             endLayer: Number(tasks.small.endLayer) || 0,
             content: extracted.smallSummary,
+            ...resolveSummaryTimes(extracted.smallTimeStart, extracted.smallTimeEnd, tasks.small.conversation),
             sourceRefs,
             sourceDigest,
             originChatId: data()?.getChatId?.() || 'default',
@@ -913,11 +1182,14 @@ window.MEMORY_ENGINE = (function() {
         addedSmall += 1;
       }
       if (tasks.big && extracted.bigSummary) {
+        const isMeta = Number(tasks.big.level) >= 2;
         eventMemory.big_summaries.push({
           id: nextBigSummaryId(eventMemory),
           startLayer: Number(tasks.big.startLayer) || 0,
           endLayer: Number(tasks.big.endLayer) || 0,
           content: extracted.bigSummary,
+          ...resolveSummaryTimes(extracted.bigTimeStart, extracted.bigTimeEnd, '', tasks.big.summaries),
+          level: Math.max(1, Number(tasks.big.level) || 1),
           childIds: clone(tasks.big.childIds || []),
           childDigest: clean(tasks.big.childDigest),
           sourceRefs: clone(tasks.big.sourceRefs || []),
@@ -925,10 +1197,13 @@ window.MEMORY_ENGINE = (function() {
           status: 'valid',
           revision: 1
         });
-        eventMemory.big_summary_cursor = Math.min(
-          eventMemory.small_summaries.length,
-          eventMemory.big_summary_cursor + Math.max(1, Number(tasks.big.consumeCount) || 1)
-        );
+        // 游标只记录纪要消费进度；更早总述不消耗纪要，不推进游标。
+        if (!isMeta) {
+          eventMemory.big_summary_cursor = Math.min(
+            eventMemory.small_summaries.length,
+            eventMemory.big_summary_cursor + Math.max(1, Number(tasks.big.consumeCount) || 1)
+          );
+        }
         updatedBig = 1;
       }
       const added = addedPersonal + entityChanges.entities + entityChanges.history + entityChanges.descriptions;
@@ -937,6 +1212,7 @@ window.MEMORY_ENGINE = (function() {
         next.chatLayer = Number.isFinite(Number(options?.layer)) ? Number(options.layer) : currentLayer();
       }
       data().saveState(next);
+      if (addedSmall) window.MEMORY_ENGINE_VECTOR?.scheduleIndexUpdate?.();
       window.WORLD_ENGINE_CHATCACHE?.forScope?.('memory')?.afterEvolution?.();
       applyInjection();
       refreshMemoryPanel();
@@ -1019,25 +1295,79 @@ window.MEMORY_ENGINE = (function() {
     };
   }
 
+  // 未归档总述积压超限后，把保留窗口之外的最旧几条合并成更高一层总述
+  // （level 2 = 更早总述，childIds 指向总述；level 3 = 最早总述，childIds 指向更早总述）。
+  // 注入侧以「最早总述 + 更早总述 + 最近几条总述」分层呈现，避免老剧情滚出注入窗口后断档。
+  function buildCompressionTask(state, force, level = 2) {
+    const st = settings(), eventMemory = ensureEventState(state);
+    const keepRecent = Math.max(1, parseInt(st.bigSummaryInjectLimit) || 3);
+    // 子层级 = 本层级 - 1；被任何有效更高层引用的子层级条目视为已吸收。
+    const childLevel = level - 1;
+    const absorbedIds = new Set(eventMemory.big_summaries
+      .filter(item => item.status === 'valid' && Number(item.level) >= level)
+      .flatMap(item => item.childIds || []));
+    const pending = eventMemory.big_summaries.filter(item =>
+      item.status === 'valid' && Number(item.level) === childLevel && !absorbedIds.has(clean(item.id)));
+    const threshold = Math.max(keepRecent + 1, Math.max(2, parseInt(st.metaSummaryEveryX) || 6));
+    if (pending.length < threshold && !(force && pending.length > keepRecent)) return null;
+    const children = pending.slice(0, Math.max(1, pending.length - keepRecent));
+    return {
+      level,
+      summaries: children,
+      startLayer: Number(children[0]?.startLayer) || 0,
+      endLayer: Number(children.at(-1)?.endLayer) || 0,
+      childIds: children.map(item => item.id),
+      childDigest: timelineApi()?.hashText?.(children.map(item => `${item.id}:${item.revision || 1}:${item.sourceDigest || ''}`).join('|')) || '',
+      sourceRefs: timelineApi()?.unionRefs?.(children.map(item => item.sourceRefs || [])) || []
+    };
+  }
+
+  // 从低层到高层找第一个到期的压缩任务。
+  function findDueCompressionTask(state, force) {
+    for (let level = 2; level <= MAX_SUMMARY_LEVEL; level++) {
+      const task = buildCompressionTask(state, force, level);
+      if (task) return task;
+    }
+    return null;
+  }
+
   async function runTasksThenDueBig(tasks, options, bigThresholdOverride) {
     const primary = await runTasks(tasks, options);
     if (primary?.skipped) return primary;
+    let result = primary;
     const after = data().loadState();
     const bigTask = buildBigTask(after, false, bigThresholdOverride);
-    if (!bigTask) return primary;
-    const bigResult = await runTasks({ big: bigTask }, {
-      ...options,
-      baseState: after,
-      saveCheckpoint: false,
-      // 世界摘要纪要只在 primary 落库一次；这里仅消费待整理纪要生成总述。
-      worldDigestMinute: null
-    });
-    return {
-      ...primary,
-      added: Number(primary.added || 0) + Number(bigResult?.updatedBig || 0),
-      updatedBig: Number(bigResult?.updatedBig || 0),
-      state: bigResult?.state || primary.state
-    };
+    if (bigTask) {
+      const bigResult = await runTasks({ big: bigTask }, {
+        ...options,
+        baseState: after,
+        saveCheckpoint: false,
+        // 世界摘要纪要只在 primary 落库一次；这里仅消费待整理纪要生成总述。
+        worldDigestMinute: null
+      });
+      result = {
+        ...primary,
+        added: Number(primary.added || 0) + Number(bigResult?.updatedBig || 0),
+        updatedBig: Number(primary.updatedBig || 0) + Number(bigResult?.updatedBig || 0),
+        state: bigResult?.state || primary.state
+      };
+    }
+    // 总述落库后逐层检查更高层压缩是否到期（level 2→3），到期层独立请求合并。
+    let metaState = data().loadState();
+    for (let level = 2; level <= MAX_SUMMARY_LEVEL; level++) {
+      const metaTask = buildCompressionTask(metaState, false, level);
+      if (!metaTask) continue;
+      const metaResult = await runTasks({ big: metaTask }, {
+        ...options, baseState: metaState, saveCheckpoint: false, worldDigestMinute: null
+      });
+      result = {
+        ...result,
+        updatedBig: Number(result.updatedBig || 0) + Number(metaResult?.updatedBig || 0),
+        state: metaResult?.state || result.state
+      };
+      metaState = data().loadState();
+    }
+    return result;
   }
 
   // 手动向前提取与重新推演共用：读取轮数 = min(配置上限, 基底状态至今的实际 AI 轮数)。
@@ -1055,41 +1385,52 @@ window.MEMORY_ENGINE = (function() {
     await reconcileHistory();
     if (st.evolveMode !== 'auto') return;
     const state = data().loadState();
-    const anchor = state.chatLayer !== null && state.chatLayer !== '' && Number.isFinite(Number(state.chatLayer))
-      ? Number(state.chatLayer) : -1;
-    const tasks = {};
-    if (countAiSince(anchor) >= Math.max(1, parseInt(st.evolveEveryX) || 1)) {
-      tasks.memory = recentConversationBatch(st.evolveReadRounds);
-    }
-    const eventMemory = ensureEventState(state);
-    const smallEvery = Math.max(1, parseInt(st.smallSummaryEveryX) || 5);
-    const smallBatch = countAiSince(eventMemory.small_summary_layer) >= smallEvery
-      ? getAiBatchAfter(eventMemory.small_summary_layer, smallEvery) : null;
-    if (smallBatch) tasks.small = smallBatch;
+    // 提取目标是最老的缺口轮而不是最新一轮：某轮失败后，后续事件会从缺口继续补齐，
+    // 不会让中间楼层永久漏出记忆链。人物/实体与纪要同轮配对，与手动提取同一口径。
+    const batch = findOldestMissingBatch(state);
     const bigTask = buildBigTask(state, false);
-    if (!tasks.memory && !tasks.small) {
-      if (!bigTask) return;
-      const result = await runTasks({ big: bigTask }, { baseState: state });
-      if (buildBigTask(data().loadState(), false)) {
+    const metaTask = findDueCompressionTask(state, false);
+    if (!batch) {
+      if (!bigTask && !metaTask) return;
+      const result = await runTasks({ big: bigTask || metaTask }, { baseState: state });
+      const latest = data().loadState();
+      if (buildBigTask(latest, false) || findDueCompressionTask(latest, false)) {
         clearTimeout(autoTimer);
         autoTimer = setTimeout(() => autoExtract().catch(error => console.error('[记忆引擎] 自动总述补进度失败', error)), 0);
       }
       return result;
     }
-    const result = await runTasksThenDueBig(tasks, { layer: currentLayer(), baseState: state });
-    const after = data().loadState(), afterEvent = ensureEventState(after);
-    if (countAiSince(afterEvent.small_summary_layer) >= smallEvery || buildBigTask(after, false)) {
+    const result = await runTasksThenDueBig({ memory: batch, small: batch }, { layer: batch.endLayer, baseState: state });
+    const after = data().loadState();
+    if (findOldestMissingBatch(after) || buildBigTask(after, false) || findDueCompressionTask(after, false)) {
       clearTimeout(autoTimer);
       autoTimer = setTimeout(() => autoExtract().catch(error => console.error('[记忆引擎] 自动纪要补进度失败', error)), 0);
     }
     return result;
   }
 
-  async function manualExtract() {
-    const st = settings();
-    if (st.engineEnabled === false) throw new Error('记忆引擎已关闭');
-    const state = data().loadState();
+  // 人物/实体节点与纪要任一缺失即视为待提取（世界联动节点不计入覆盖，与手动提取口径一致）。
+  function isMemoryBatchCovered(batch, timeline, eventMemory) {
+    const digest = timelineApi()?.digestRefs?.(batch.sourceRefs || []) || '';
+    if (!digest) return false;
+    const hasNode = timeline.nodes.some(node =>
+      node.kind === 'memory' && node.status === 'valid' && clean(node.sourceDigest) === digest
+    );
+    const hasSummary = eventMemory.small_summaries.some(summary =>
+      summary.status !== 'stale' && clean(summary.sourceDigest) === digest
+    );
+    return hasNode && hasSummary;
+  }
+
+  // 从最老的缺口轮开始扫描。
+  function findOldestMissingBatch(state) {
     const timeline = ensureTimelineState(state), eventMemory = ensureEventState(state);
+    // 「首楼为 AI 开场白」关闭后第 0 层按普通对话参与提取；它排在已处理游标之前，
+    // 常规的前向扫描永远够不到，这里单独核对其覆盖情况，没提取过就作为缺口返回。
+    if (!ignoreFirstLayer(settings())) {
+      const openingBatch = getAiBatchAfter(-1, 1);
+      if (openingBatch && !isMemoryBatchCovered(openingBatch, timeline, eventMemory)) return openingBatch;
+    }
     const memoryLayer = state.chatLayer !== null && state.chatLayer !== '' && Number.isFinite(Number(state.chatLayer))
       ? Number(state.chatLayer) : null;
     const summaryLayer = eventMemory.small_summary_layer !== null && eventMemory.small_summary_layer !== ''
@@ -1101,24 +1442,22 @@ window.MEMORY_ENGINE = (function() {
     // 若已经存在带正文来源的纪要，则从头寻找尚缺人物实体的最早一轮，补齐两条链。
     let anchor = memoryLayer === null ? (hasTrackedSummaries ? -1 : (summaryLayer ?? -1))
       : (summaryLayer === null ? memoryLayer : Math.min(memoryLayer, summaryLayer));
-    let batch = null;
     while (true) {
       const candidate = getAiBatchAfter(anchor, 1);
-      if (!candidate) break;
-      const digest = timelineApi()?.digestRefs?.(candidate.sourceRefs || []) || '';
-      const hasNode = digest && timeline.nodes.some(node =>
-        node.kind === 'memory' && node.status === 'valid' && clean(node.sourceDigest) === digest
-      );
-      const hasSummary = digest && eventMemory.small_summaries.some(summary =>
-        summary.status !== 'stale' && clean(summary.sourceDigest) === digest
-      );
-      if (hasNode && hasSummary) {
+      if (!candidate) return null;
+      if (isMemoryBatchCovered(candidate, timeline, eventMemory)) {
         anchor = candidate.endLayer;
         continue;
       }
-      batch = candidate;
-      break;
+      return candidate;
     }
+  }
+
+  async function manualExtract() {
+    const st = settings();
+    if (st.engineEnabled === false) throw new Error('记忆引擎已关闭');
+    const state = data().loadState();
+    const batch = findOldestMissingBatch(state);
     if (!batch) throw new Error('当前没有尚未提取的新一轮正文');
     return runTasksThenDueBig({ memory: batch, small: batch }, {
       ...batch, layer: batch.endLayer, baseState: state
@@ -1215,9 +1554,26 @@ window.MEMORY_ENGINE = (function() {
   async function manualBigSummary() {
     const st = settings();
     if (st.engineEnabled === false) throw new Error('记忆引擎已关闭');
-    const state = data().loadState(), bigTask = buildBigTask(state, true);
-    if (!bigTask) throw new Error('当前没有尚未并入总述的纪要');
-    return runTasks({ big: bigTask }, { baseState: state });
+    const state = data().loadState();
+    const bigTask = buildBigTask(state, true);
+    const metaTask = findDueCompressionTask(state, true);
+    if (!bigTask && !metaTask) throw new Error('当前没有尚未并入总述的纪要');
+    let result = null;
+    if (bigTask) result = await runTasks({ big: bigTask }, { baseState: state });
+    // 总述落库后顺带合并到期的更高层总述（逐层），让手动入口与自动链保持同一进度。
+    let metaState = data().loadState();
+    for (let level = 2; level <= MAX_SUMMARY_LEVEL; level++) {
+      const dueMeta = buildCompressionTask(metaState, true, level);
+      if (!dueMeta) continue;
+      const metaResult = await runTasks({ big: dueMeta }, { baseState: metaState });
+      result = {
+        ...(result || { added: 0, extracted: 0 }),
+        updatedBig: Number(result?.updatedBig || 0) + Number(metaResult?.updatedBig || 0),
+        state: metaResult.state
+      };
+      metaState = data().loadState();
+    }
+    return result;
   }
 
   function newHistoryAuditReport() {
@@ -1303,7 +1659,9 @@ window.MEMORY_ENGINE = (function() {
     }
     for (const overview of eventMemory.big_summaries) {
       if (!Array.isArray(overview.childIds) || !overview.childIds.length) continue;
-      const children = overview.childIds.map(id => eventMemory.small_summaries.find(item => item.id === id)).filter(Boolean);
+      // 更早层总述（level ≥ 2）的子节点是总述；普通总述的子节点是纪要。校验公式一致。
+      const pool = Number(overview.level) >= 2 ? eventMemory.big_summaries : eventMemory.small_summaries;
+      const children = overview.childIds.map(id => pool.find(item => item.id === id)).filter(Boolean);
       const digest = api?.hashText?.(children.map(item => `${item.id}:${item.revision || 1}:${item.sourceDigest || ''}`).join('|')) || '';
       const valid = children.length === overview.childIds.length
         && children.every(item => item.status === 'valid')
@@ -1345,6 +1703,7 @@ window.MEMORY_ENGINE = (function() {
     node.endLayer = bounds.endLayer;
     node.personal = clone(extracted.personal || []);
     node.entities = clone(extracted.entities || {});
+    node.npcs = clone(extracted.npcs || []);
     node.status = 'valid';
     node.revision = Math.max(1, Number(node.revision) || 1) + 1;
     node.updatedAt = Date.now();
@@ -1402,10 +1761,12 @@ window.MEMORY_ENGINE = (function() {
     node.endLayer = bounds.endLayer;
     node.personal = clone(extracted.personal || []);
     node.entities = clone(extracted.entities || {});
+    node.npcs = clone(extracted.npcs || []);
     node.status = 'valid';
     node.revision = Math.max(1, Number(node.revision) || 1) + 1;
     node.updatedAt = Date.now();
 
+    const times = resolveSummaryTimes(extracted.smallTimeStart, extracted.smallTimeEnd, conversation);
     if (!summary) {
       summary = {
         id: nextSmallSummaryId(eventMemory),
@@ -1414,6 +1775,7 @@ window.MEMORY_ENGINE = (function() {
         sourceRefs: clone(summaryAudit.refs),
         sourceDigest: summaryDigest,
         content: extracted.smallSummary,
+        ...times,
         originChatId: data()?.getChatId?.() || 'default',
         status: 'valid',
         revision: 1
@@ -1426,10 +1788,13 @@ window.MEMORY_ENGINE = (function() {
       summary.sourceRefs = clone(summaryAudit.refs);
       summary.sourceDigest = summaryDigest;
       summary.content = extracted.smallSummary;
+      summary.timeStart = times.timeStart;
+      summary.timeEnd = times.timeEnd;
       summary.status = 'valid';
       summary.revision = Math.max(1, Number(summary.revision) || 1) + 1;
     }
     data().saveState(replayTimeline(state));
+    window.MEMORY_ENGINE_VECTOR?.scheduleIndexUpdate?.();
     refreshMemoryPanel();
     const extractedCount = (extracted.personal || []).length
       + ENTITY_TYPES.reduce((sum, type) => sum + (extracted.entities?.[type] || []).length, 0);
@@ -1468,9 +1833,13 @@ window.MEMORY_ENGINE = (function() {
     summary.sourceRefs = clone(audit.refs);
     summary.sourceDigest = api?.digestRefs?.(audit.refs) || '';
     summary.content = extracted.smallSummary;
+    const repairedTimes = resolveSummaryTimes(extracted.smallTimeStart, extracted.smallTimeEnd, conversation);
+    summary.timeStart = repairedTimes.timeStart;
+    summary.timeEnd = repairedTimes.timeEnd;
     summary.status = 'valid';
     summary.revision = Math.max(1, Number(summary.revision) || 1) + 1;
     data().saveState(state);
+    window.MEMORY_ENGINE_VECTOR?.scheduleIndexUpdate?.();
     refreshMemoryPanel();
     return true;
   }
@@ -1479,7 +1848,10 @@ window.MEMORY_ENGINE = (function() {
     let state = data().loadState(), eventMemory = ensureEventState(state);
     let overview = eventMemory.big_summaries.find(item => item.id === overviewId);
     if (!overview || overview.status !== 'stale') return false;
-    const children = (overview.childIds || []).map(id => eventMemory.small_summaries.find(item => item.id === id)).filter(Boolean);
+    // 更早层总述（level ≥ 2）从总述池取子节点，普通总述从纪要池取；重提取请求保持对应层级。
+    const isMeta = Number(overview.level) >= 2;
+    const pool = isMeta ? eventMemory.big_summaries : eventMemory.small_summaries;
+    const children = (overview.childIds || []).map(id => pool.find(item => item.id === id)).filter(Boolean);
     if (!children.length) {
       eventMemory.big_summaries = eventMemory.big_summaries.filter(item => item.id !== overviewId);
       data().saveState(state);
@@ -1487,13 +1859,16 @@ window.MEMORY_ENGINE = (function() {
     }
     if (children.some(item => item.status !== 'valid')) return false;
     const api = timelineApi();
-    const extracted = await requestTasks({ big: { summaries: children } }, { baseState: state });
+    const extracted = await requestTasks({ big: { summaries: children, level: isMeta ? 2 : 1 } }, { baseState: state });
 
     state = data().loadState();
     eventMemory = ensureEventState(state);
     overview = eventMemory.big_summaries.find(item => item.id === overviewId);
     if (!overview) return false;
     overview.content = extracted.bigSummary;
+    const overviewTimes = resolveSummaryTimes(extracted.bigTimeStart, extracted.bigTimeEnd, '', children);
+    overview.timeStart = overviewTimes.timeStart;
+    overview.timeEnd = overviewTimes.timeEnd;
     overview.childIds = children.map(item => item.id);
     overview.startLayer = Number(children[0]?.startLayer) || 0;
     overview.endLayer = Number(children.at(-1)?.endLayer) || 0;
@@ -1598,6 +1973,7 @@ window.MEMORY_ENGINE = (function() {
   function abort() {
     backfillRunning = false;
     abortController?.abort();
+    window.MEMORY_ENGINE_VECTOR?.abortRecall?.();
   }
 
   function clearInjection() {
@@ -1625,6 +2001,10 @@ window.MEMORY_ENGINE = (function() {
       state = replayTimeline(state);
       data().saveState(state);
     }
+    // 远事召回：生成前阻塞完成（酒馆会 await 生成拦截器 → 此处），失败静默无节。
+    vectorRecallPromise = Promise.resolve(window.MEMORY_ENGINE_VECTOR?.recallForGeneration?.())
+      .catch(error => console.warn('[记忆引擎] 远事召回失败（已隔离）', error));
+    await vectorRecallPromise;
     // stale 纪要/总述不会再注入；其来源正文（例如第 3、4 楼）会从隐藏集合移除。
     applyInjection();
     await hiddenSyncPromise;
@@ -1676,8 +2056,9 @@ window.MEMORY_ENGINE = (function() {
     const eventMemory = ensureEventState(state);
     const hasPeople = Boolean(state?.personal_memory?.length);
     const hasEntities = ENTITY_TYPES.some(type => state.entity_memory[type].length);
+    const hasNpcs = Boolean(state?.npc_profiles?.length);
     const hasEvents = Boolean(eventMemory.big_summaries.length || eventMemory.small_summaries.length);
-    if (!hasPeople && !hasEntities && !hasEvents) {
+    if (!hasPeople && !hasEntities && !hasNpcs && !hasEvents) {
       clearInjection();
       syncHiddenMessages(new Set(), '恢复正文失败');
       return '';
@@ -1694,26 +2075,55 @@ window.MEMORY_ENGINE = (function() {
       .map(entity => ({ type, entity })));
     const sections = [], globalSeen = new Set(), limit = Math.max(1, parseInt(st.maxPerCharacter) || 20);
     const bigLimit = Math.max(1, parseInt(st.bigSummaryInjectLimit) || 3);
+    // 故事内「现在」只解析一次，供各注入行的相对距离前缀使用。
+    const nowTotal = latestStoryDayTotal();
     const validBig = eventMemory.big_summaries.filter(item => item.status !== 'stale' && item.status !== 'failed');
-    const recentBig = validBig.slice(-bigLimit);
-    if (recentBig.length) {
-      sections.push(`【故事总述】\n${recentBig.map(item =>
-        `- [楼层 ${item.startLayer}-${item.endLayer}] ${item.content}`
+    const higherChildIds = new Set(validBig.filter(item => Number(item.level) >= 2).flatMap(item => item.childIds || []));
+    // 被更高层总述吸收的总述不再逐条注入，由上层总述代表。
+    const activeBig = validBig.filter(item => Number(item.level) < 2 && !higherChildIds.has(clean(item.id)));
+    const recentBig = activeBig.slice(-bigLimit);
+    // 更早层按级别分节（最高层在前），每层排除被更高层吸收的条目、只注入最近几条。
+    const injectedHigher = [];
+    for (let level = MAX_SUMMARY_LEVEL; level >= 2; level--) {
+      const absorbedHere = new Set(validBig.filter(item => Number(item.level) > level).flatMap(item => item.childIds || []));
+      const items = validBig.filter(item => Number(item.level) === level && !absorbedHere.has(clean(item.id))).slice(-bigLimit);
+      if (!items.length) continue;
+      injectedHigher.push(...items);
+      sections.push(`【${SUMMARY_LEVEL_LABELS[level] || '更早总述'}】\n${items.map(item =>
+        `- [${formatSummaryLabel(item, nowTotal)}] ${item.content}`
       ).join('\n')}`);
     }
-    // 总述注入上限只控制进入 prompt 的总述数量；判断纪要是否已经整理时，
-    // 必须查看全部有效总述，避免旧总述退出注入窗口后其子纪要重新被注入。
-    const coveredChildIds = new Set(validBig.flatMap(item => item.childIds || []));
+    if (recentBig.length) {
+      sections.push(`【故事总述】\n${recentBig.map(item =>
+        `- [${formatSummaryLabel(item, nowTotal)}] ${item.content}`
+      ).join('\n')}`);
+    }
+    // 纪要是否已整理必须看全部有效总述的传递覆盖（更早总述 → 总述 → 纪要），且不限于本次注入的几条；
+    // 否则旧总述退出注入窗口后其子纪要会重新被注入。
+    const validBigById = new Map(validBig.map(item => [item.id, item]));
+    const coveredChildIds = new Set();
+    for (const overview of validBig) {
+      const walk = node => {
+        for (const childId of node.childIds || []) {
+          if (coveredChildIds.has(childId)) continue;
+          coveredChildIds.add(childId);
+          const child = validBigById.get(childId);
+          if (child) walk(child);
+        }
+      };
+      walk(overview);
+    }
     const hasStructuredOverview = eventMemory.big_summaries.some(item => Array.isArray(item.childIds) && item.childIds.length);
+    const smallLimit = Math.max(1, parseInt(st.smallSummaryInjectLimit) || 10);
     const pendingSmall = eventMemory.small_summaries.filter((item, index) => {
       if (item.status === 'stale' || item.status === 'failed') return false;
       // 新结构按 childIds 精确判断；旧数据没有 childIds 时继续兼容游标。
       if (hasStructuredOverview) return !coveredChildIds.has(item.id);
       return index >= eventMemory.big_summary_cursor;
-    });
+    }).slice(-smallLimit);
     if (pendingSmall.length) {
       sections.push(`【近期事件纪要】\n${pendingSmall.map(item =>
-        `- [楼层 ${item.startLayer}-${item.endLayer}] ${item.content}`
+        `- [${formatSummaryLabel(item, nowTotal)}] ${item.content}`
       ).join('\n')}`);
     }
     for (const character of matched) {
@@ -1730,6 +2140,20 @@ window.MEMORY_ENGINE = (function() {
       if (selected.length) sections.push(`【${character.names?.[0] || character.id}】\n` +
         selected.map(record => `- [${record.time || '时间未明'}] ${record.memory}`).join('\n'));
     }
+    // 人物当前状态：最近楼层出现名字才注入；只注入可观察字段，空档案不出行细节。
+    const matchedNpcs = (state.npc_profiles || []).filter(profile => (profile.names || []).some(appearsInScan));
+    if (matchedNpcs.length) {
+      sections.push(`【人物当前状态】\n${matchedNpcs.map(profile => {
+        const label = clean(profile.names?.[0]) || profile.id;
+        const aliases = (profile.names || []).slice(1).map(clean).filter(Boolean).join(' / ');
+        const parts = [
+          clean(profile.location) ? `位置：${clean(profile.location)}` : '',
+          clean(profile.condition) ? `处境：${clean(profile.condition)}` : '',
+          clean(profile.stance) ? `态度：${clean(profile.stance)}` : ''
+        ].filter(Boolean);
+        return `- ${label}${aliases ? `（${aliases}）` : ''}：${parts.length ? parts.join('；') : '暂无可靠观察'}`;
+      }).join('\n')}`);
+    }
     if (matchedEntities.length) {
       const entitySections = matchedEntities.map(({ type, entity }) => {
         const lines = [`【${ENTITY_LABELS[type]}：${entity.name}】`, entity.description];
@@ -1741,7 +2165,19 @@ window.MEMORY_ENGINE = (function() {
       });
       sections.push(`【相关世界实体】\n${entitySections.join('\n\n')}`);
     }
+    // 远事召回：向量检索到的旧纪要（生成前预计算）；与本次注入的未整理纪要按来源指纹去重。
+    const recall = window.MEMORY_ENGINE_VECTOR?.getLastRecall?.();
+    if (recall?.items?.length) {
+      const injectedDigests = new Set(pendingSmall.map(item => clean(item.sourceDigest)));
+      const recallItems = recall.items.filter(item => clean(item.digest) && !injectedDigests.has(clean(item.digest)));
+      if (recallItems.length) {
+        sections.push(`【远事召回】\n${recallItems.map(item =>
+          `- [${formatSummaryLabel(item, nowTotal)}] ${clean(item.content)}`
+        ).join('\n')}`);
+      }
+    }
     const coveredRefs = timelineApi()?.unionRefs?.([
+      ...injectedHigher.map(item => item.sourceRefs || []),
       ...recentBig.map(item => item.sourceRefs || []),
       ...pendingSmall.map(item => item.sourceRefs || [])
     ]) || [];
@@ -1755,7 +2191,7 @@ window.MEMORY_ENGINE = (function() {
     })();
     syncHiddenMessages(coveredMessageIds, '同步正文覆盖失败');
     if (!sections.length) { clearInjection(); return ''; }
-    const content = `${SENTINEL}\n事件总结记录对话中已经发生的剧情；人物条目是当前场景人物持有或明确知晓的主观记忆，允许彼此矛盾；实体条目记录相关组织、物件、能力与地点的当前描述和本地历史。\n\n${sections.join('\n\n')}`;
+    const content = `${SENTINEL}\n事件总结记录对话中已经发生的剧情；人物条目是当前场景人物持有或明确知晓的主观记忆，允许彼此矛盾；实体条目记录相关组织、物件、能力与地点的当前描述和本地历史。\n以上全部内容是仅供你参考的私密记忆简报：严禁在回复中复述或逐条引用，也不要向用户提及这些记录的存在。\n\n${sections.join('\n\n')}`;
     registerInjection(content);
     return content;
   }
@@ -1797,6 +2233,16 @@ window.MEMORY_ENGINE = (function() {
           .map(entry => `- [${entry.time || '时间未明'}] ${entry.event}`));
         sections.push(lines.join('\n'));
       }
+    }
+    // 命中世界状态的人物附带当前状态，供推演判断在场与态度。
+    for (const profile of state.npc_profiles || []) {
+      if (!(profile.names || []).some(appears)) continue;
+      const parts = [
+        clean(profile.location) ? `位置：${clean(profile.location)}` : '',
+        clean(profile.condition) ? `处境：${clean(profile.condition)}` : '',
+        clean(profile.stance) ? `态度：${clean(profile.stance)}` : ''
+      ].filter(Boolean);
+      if (parts.length) sections.push(`【人物状态：${clean(profile.names?.[0]) || profile.id}】\n${parts.join('；')}`);
     }
     if (!sections.length) return '';
     return `【记忆引擎提供的相关人物与实体信息】\n以下信息只用于辅助世界推演；不包含纪要或总述。\n\n${sections.join('\n\n')}`;
@@ -1846,6 +2292,24 @@ window.MEMORY_ENGINE = (function() {
     }
   }
 
+  // 断点续填进度：记在记忆状态里，与重填成果同生共死（回档/换聊天自动跟随）。
+  function loadBackfillProgress() {
+    const progress = data().loadState()?.backfill_progress;
+    return progress && typeof progress === 'object' ? progress : {};
+  }
+  function saveBackfillProgress(kind, value) {
+    const current = data().loadState();
+    const progress = current.backfill_progress && typeof current.backfill_progress === 'object' ? { ...current.backfill_progress } : {};
+    if (value) progress[kind] = {
+      nextLayer: Math.max(0, parseInt(value.nextLayer) || 0),
+      endLayer: Math.max(0, parseInt(value.endLayer) || 0),
+      // 记下当时的「首楼为 AI 开场白」取值：开关变更说明填充范围变了，旧断点作废。
+      opening: value.opening === true
+    };
+    else delete progress[kind];
+    data().saveState({ ...current, backfill_progress: progress });
+  }
+
   function setBackfillStatus(current, total, message) {
     backfillStatus = { running: backfillRunning, current, total, message: message || '' };
     const element = document.getElementById('we-memory-person-backfill-status');
@@ -1866,37 +2330,83 @@ window.MEMORY_ENGINE = (function() {
     const end = Math.min(all.length - 1, configuredEnd || all.length - 1);
     const opening = ignoreFirstLayer(st);
     const aiLayers = all.map((message, index) => (!message?.is_user && index <= end && !(opening && index === 0) ? index : -1)).filter(i => i >= 0);
-    const size = Math.max(1, parseInt(st.backfillBatchSize) || 5), batches = [];
-    for (let i = 0; i < aiLayers.length; i += size) batches.push(aiLayers.slice(i, i + size));
-    if (!batches.length) { setBackfillStatus(0, 0, '没有可重填的 AI 楼层'); return; }
+    const size = Math.max(1, parseInt(st.backfillBatchSize) || 5);
+    // 断点续填：上次失败或中止留下的进度接着跑，已入库的成果不再清掉。
+    // 「首楼为 AI 开场白」开关与断点记录不一致时视为填充范围变更，旧断点作废、整库重建。
+    const personProgress = loadBackfillProgress().person;
+    const resumeFrom = Number(personProgress?.nextLayer);
+    const resuming = Number.isFinite(resumeFrom) && resumeFrom > 0 && personProgress.opening === opening;
+    const batches = [];
+    for (let i = 0; i < aiLayers.length; i += size) {
+      const layers = resuming ? aiLayers.slice(i, i + size).filter(l => l >= resumeFrom) : aiLayers.slice(i, i + size);
+      if (layers.length) batches.push(layers);
+    }
+    if (!batches.length) {
+      if (resuming) { saveBackfillProgress('person', null); setBackfillStatus(0, 0, '没有可续填的 AI 楼层，进度已清除'); }
+      else setBackfillStatus(0, 0, '没有可重填的 AI 楼层');
+      return;
+    }
     backfillRunning = true;
-    window.WORLD_ENGINE_CHATCACHE?.forScope?.('memory')?.createSnapshot?.('记忆重填前自动备份');
-    const original = data().loadState();
-    data().saveCheckpoint(original);
-    data().saveState({
-      ...original,
-      personal_memory: [],
-      knowledge_index: {},
-      entity_memory: { organization: [], object: [], ability: [], location: [] },
-      entity_index: {},
-      round: 0,
-      chatLayer: null,
-      timeline: null
-    });
     try {
+      if (resuming) {
+        setBackfillStatus(0, batches.length, `检测到上次进度，从第 ${resumeFrom} 楼继续`);
+      } else {
+        window.WORLD_ENGINE_CHATCACHE?.forScope?.('memory')?.createSnapshot?.('记忆重填前自动备份');
+        const original = data().loadState();
+        data().saveCheckpoint(original);
+        data().saveState({
+          ...original,
+          personal_memory: [],
+          knowledge_index: {},
+          entity_memory: { organization: [], object: [], ability: [], location: [] },
+          entity_index: {},
+          round: 0,
+          chatLayer: null,
+          timeline: null
+        });
+      }
       for (let i = 0; i < batches.length && backfillRunning; i++) {
         const layers = batches[i], start = Math.max(0, layers[0] - 1), finish = layers.at(-1);
         setBackfillStatus(i, batches.length, `正在重填 ${i + 1} / ${batches.length}`);
-        await extractConversation(formatMessages(all.slice(start, finish + 1), start), {
-          startLayer: start,
-          endLayer: finish,
-          sourceRefs: timelineApi()?.captureRange?.(start, finish) || [],
-          layer: finish, retries: st.backfillRetries, saveCheckpoint: true, allowWhileBackfill: true
-        });
+        try {
+          await extractConversation(formatMessages(all.slice(start, finish + 1), start), {
+            startLayer: start,
+            endLayer: finish,
+            sourceRefs: timelineApi()?.captureRange?.(start, finish) || [],
+            layer: finish, retries: st.backfillRetries, saveCheckpoint: true, allowWhileBackfill: true
+          });
+          saveBackfillProgress('person', { nextLayer: finish + 1, endLayer: end, opening });
+        } catch (error) {
+          if (abortController?.signal?.aborted || error?.name === 'AbortError') throw error;
+          // 整批请求失败时降级为逐轮提取；单轮仍失败才中止——跳过楼层继续会造成静默缺口。
+          setBackfillStatus(i, batches.length, `第 ${i + 1} 批失败，降级为逐轮重填`);
+          for (const layer of layers) {
+            if (!backfillRunning) break;
+            const roundStart = all[layer - 1]?.is_user ? layer - 1 : layer;
+            try {
+              await extractConversation(formatMessages(all.slice(roundStart, layer + 1), roundStart), {
+                startLayer: roundStart,
+                endLayer: layer,
+                sourceRefs: timelineApi()?.captureRange?.(roundStart, layer) || [],
+                layer, retries: st.backfillRetries, saveCheckpoint: true, allowWhileBackfill: true
+              });
+              saveBackfillProgress('person', { nextLayer: layer + 1, endLayer: end, opening });
+            } catch (roundError) {
+              if (abortController?.signal?.aborted || roundError?.name === 'AbortError') throw roundError;
+              throw new Error(`第 ${layer} 楼逐轮重填仍失败：${roundError?.message || roundError}`);
+            }
+          }
+        }
       }
-      setBackfillStatus(batches.length, batches.length, backfillRunning ? '记忆重填完成' : '记忆重填已停止');
+      if (!backfillRunning) { setBackfillStatus(backfillStatus.current, batches.length, '记忆重填已停止，进度已保留，再次开始将继续'); return; }
+      saveBackfillProgress('person', null);
+      setBackfillStatus(batches.length, batches.length, '记忆重填完成');
     } catch (error) {
-      setBackfillStatus(backfillStatus.current, batches.length, `重填失败：${error?.message || error}`);
+      const aborted = abortController?.signal?.aborted || error?.name === 'AbortError';
+      const stuck = loadBackfillProgress().person?.nextLayer;
+      setBackfillStatus(backfillStatus.current, batches.length, aborted
+        ? `记忆重填已停止${stuck ? `，已填到第 ${stuck} 楼` : ''}，再次开始将继续`
+        : `重填失败：${error?.message || error}${stuck ? `（已填到第 ${stuck} 楼，再次开始将继续）` : ''}`);
       throw error;
     } finally { backfillRunning = false; backfillStatus.running = false; applyInjection(); }
   }
@@ -1909,18 +2419,34 @@ window.MEMORY_ENGINE = (function() {
     const end = Math.min(all.length - 1, configuredEnd || all.length - 1);
     const opening = ignoreFirstLayer(st);
     const aiLayers = all.map((message, index) => (!message?.is_user && index <= end && !(opening && index === 0) ? index : -1)).filter(index => index >= 0);
-    const size = Math.max(1, parseInt(st.summaryBackfillSmallEveryX) || 5), batches = [];
-    for (let i = 0; i < aiLayers.length; i += size) batches.push(aiLayers.slice(i, i + size));
-    if (!batches.length) { setSummaryBackfillStatus(0, 0, '没有可重填的 AI 楼层'); return; }
+    const size = Math.max(1, parseInt(st.summaryBackfillSmallEveryX) || 5);
+    // 断点续填：与人物/实体重填同一套进度标记，两类互不干扰；开关变更同样作废旧断点。
+    const summaryProgress = loadBackfillProgress().summary;
+    const resumeFrom = Number(summaryProgress?.nextLayer);
+    const resuming = Number.isFinite(resumeFrom) && resumeFrom > 0 && summaryProgress.opening === opening;
+    const batches = [];
+    for (let i = 0; i < aiLayers.length; i += size) {
+      const layers = resuming ? aiLayers.slice(i, i + size).filter(l => l >= resumeFrom) : aiLayers.slice(i, i + size);
+      if (layers.length) batches.push(layers);
+    }
+    if (!batches.length) {
+      if (resuming) { saveBackfillProgress('summary', null); setSummaryBackfillStatus(0, 0, '没有可续填的 AI 楼层，进度已清除'); }
+      else setSummaryBackfillStatus(0, 0, '没有可重填的 AI 楼层');
+      return;
+    }
     backfillRunning = true;
-    window.WORLD_ENGINE_CHATCACHE?.forScope?.('memory')?.createSnapshot?.('纪要与总述重填前自动备份');
-    const original = data().loadState();
-    data().saveCheckpoint(original);
-    data().saveState({
-      ...original,
-      event_memory: { small_summaries: [], big_summaries: [], small_summary_layer: null, big_summary_cursor: 0 }
-    });
     try {
+      if (resuming) {
+        setSummaryBackfillStatus(0, batches.length, `检测到上次进度，从第 ${resumeFrom} 楼继续`);
+      } else {
+        window.WORLD_ENGINE_CHATCACHE?.forScope?.('memory')?.createSnapshot?.('纪要与总述重填前自动备份');
+        const original = data().loadState();
+        data().saveCheckpoint(original);
+        data().saveState({
+          ...original,
+          event_memory: { small_summaries: [], big_summaries: [], small_summary_layer: null, big_summary_cursor: 0 }
+        });
+      }
       for (let i = 0; i < batches.length && backfillRunning; i++) {
         const layers = batches[i], firstAi = layers[0], finish = layers.at(-1);
         const start = firstAi > 0 && all[firstAi - 1]?.is_user ? firstAi - 1 : firstAi;
@@ -1930,15 +2456,46 @@ window.MEMORY_ENGINE = (function() {
           conversation: formatMessages(all.slice(start, finish + 1), start),
           sourceRefs: timelineApi()?.captureRange?.(start, finish) || []
         };
-        const state = data().loadState();
         setSummaryBackfillStatus(i, batches.length, `正在重填纪要与总述 ${i + 1} / ${batches.length}`);
-        await runTasksThenDueBig({ small: smallTask }, {
-          baseState: state, retries: st.backfillRetries, saveCheckpoint: true, allowWhileBackfill: true
-        }, st.summaryBackfillBigEveryX);
+        try {
+          await runTasksThenDueBig({ small: smallTask }, {
+            baseState: data().loadState(), retries: st.backfillRetries, saveCheckpoint: true, allowWhileBackfill: true
+          }, st.summaryBackfillBigEveryX);
+          saveBackfillProgress('summary', { nextLayer: finish + 1, endLayer: end, opening });
+        } catch (error) {
+          if (error?.name === 'AbortError') throw error;
+          // 整批纪要失败时降级为逐轮总结；单轮仍失败才中止并报告卡住的楼层。
+          setSummaryBackfillStatus(i, batches.length, `第 ${i + 1} 批失败，降级为逐轮纪要`);
+          for (const layer of layers) {
+            if (!backfillRunning) break;
+            const roundStart = all[layer - 1]?.is_user ? layer - 1 : layer;
+            const roundTask = {
+              startLayer: roundStart,
+              endLayer: layer,
+              conversation: formatMessages(all.slice(roundStart, layer + 1), roundStart),
+              sourceRefs: timelineApi()?.captureRange?.(roundStart, layer) || []
+            };
+            try {
+              await runTasksThenDueBig({ small: roundTask }, {
+                baseState: data().loadState(), retries: st.backfillRetries, saveCheckpoint: true, allowWhileBackfill: true
+              }, st.summaryBackfillBigEveryX);
+              saveBackfillProgress('summary', { nextLayer: layer + 1, endLayer: end, opening });
+            } catch (roundError) {
+              if (roundError?.name === 'AbortError') throw roundError;
+              throw new Error(`第 ${layer} 楼逐轮纪要仍失败：${roundError?.message || roundError}`);
+            }
+          }
+        }
       }
-      setSummaryBackfillStatus(batches.length, batches.length, backfillRunning ? '纪要与总述重填完成' : '纪要与总述重填已停止');
+      if (!backfillRunning) { setSummaryBackfillStatus(summaryBackfillStatus.current, batches.length, '纪要与总述重填已停止，进度已保留，再次开始将继续'); return; }
+      saveBackfillProgress('summary', null);
+      setSummaryBackfillStatus(batches.length, batches.length, '纪要与总述重填完成');
     } catch (error) {
-      setSummaryBackfillStatus(summaryBackfillStatus.current, batches.length, `纪要与总述重填失败：${error?.message || error}`);
+      const aborted = error?.name === 'AbortError';
+      const stuck = loadBackfillProgress().summary?.nextLayer;
+      setSummaryBackfillStatus(summaryBackfillStatus.current, batches.length, aborted
+        ? `纪要与总述重填已停止${stuck ? `，已填到第 ${stuck} 楼` : ''}，再次开始将继续`
+        : `纪要与总述重填失败：${error?.message || error}${stuck ? `（已填到第 ${stuck} 楼，再次开始将继续）` : ''}`);
       throw error;
     } finally { backfillRunning = false; summaryBackfillStatus.running = false; applyInjection(); }
   }
@@ -1948,6 +2505,15 @@ window.MEMORY_ENGINE = (function() {
     abortController?.abort();
     setBackfillStatus(backfillStatus.current, backfillStatus.total, '正在停止…');
     setSummaryBackfillStatus(summaryBackfillStatus.current, summaryBackfillStatus.total, '正在停止…');
+  }
+
+  // 清除断点进度：下次两类重填都从初始层整库重来（成果本身不动）。
+  function resetBackfillProgress() {
+    if (backfillRunning) throw new Error('重填正在进行，请先停止');
+    saveBackfillProgress('person', null);
+    saveBackfillProgress('summary', null);
+    setBackfillStatus(0, 0, '进度已清除，下次开始将从初始层重填');
+    setSummaryBackfillStatus(0, 0, '进度已清除，下次开始将从初始层重填');
   }
 
   function onMessageReceived() {
@@ -1992,6 +2558,7 @@ window.MEMORY_ENGINE = (function() {
         abortController?.abort();
         lastEventKey = '';
         initializeSummaryBaseline();
+        window.MEMORY_ENGINE_VECTOR?.scheduleIndexUpdate?.();
         schedulePreparation(100);
       }));
       ctx.eventSource.on(types.MESSAGE_SWIPED || 'message_swiped', guardEvent('滑动重生成', () => {
@@ -2018,16 +2585,22 @@ window.MEMORY_ENGINE = (function() {
     init, applyInjection, buildWorldEngineContext, ingestWorldEvolution, manualExtract, manualReextract, extractNow: manualExtract,
     reconcileHistory, prepareHistoryForGeneration, replayTimeline, commitManualState,
     manualSmallSummary, manualBigSummary,
-    backfill, backfillSummaries, stopBackfill, abort,
+    backfill, backfillSummaries, stopBackfill, abort, resetBackfillProgress,
     repairStateIndexes, replaceKnownByRecords,
     getLastDebug: () => clone(lastDebug), getBackfillStatus: () => clone(backfillStatus),
     getSummaryBackfillStatus: () => clone(summaryBackfillStatus),
+    getBackfillProgress: () => clone(loadBackfillProgress()),
     getRunningLabel: () => runningLabel,
     isRunning: () => running || backfillRunning || reconciling,
     _test: {
       exponentialMemorySample, rollbackLinkedLayer, removeLinkedLayerFromState, rewindSummaryCursorForDeletedLayers,
       buildSmallHistoryContext, buildTaskReferenceContext, previousRawReference,
-      parseResponse, selectHiddenMessageIds, recentRawRoundMessageIds
+      parseResponse, selectHiddenMessageIds, recentRawRoundMessageIds,
+      stripThinking, normalizeJsonText, escapeStrayQuotes, extractJsonPayload, clampSentence,
+      buildMetaTask: buildCompressionTask, buildCompressionTask, findDueCompressionTask, findOldestMissingBatch,
+      getAiBatchAfter, isMemoryBatchCovered, ignoreFirstLayer, mergeNpcProfiles, findNpcProfile,
+      extractStoryTimeRange, resolveSummaryTimes, formatSummaryTimeRange, formatSummaryRefLabel,
+      formatRelativeStoryAge, formatSummaryLabel
     }
   };
 })();

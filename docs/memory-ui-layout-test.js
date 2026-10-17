@@ -1,8 +1,9 @@
-const assert = require('assert');
-const fs = require('fs');
-const path = require('path');
+import assert from 'node:assert';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-const root = path.resolve(__dirname, '..');
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const ui = fs.readFileSync(path.join(root, 'world-engine-ui.js'), 'utf8');
 const css = fs.readFileSync(path.join(root, 'style.css'), 'utf8');
 

@@ -1,7 +1,7 @@
 // memory-engine-settings.js — 记忆引擎独立设置（只复用 API/调度等实现，不共享配置值）
 window.MEMORY_ENGINE_SETTINGS = (function() {
   const STORAGE_KEY = 'memory_engine_settings';
-  const VERSION = '1.2.0';
+  const VERSION = '1.5.0';
   const DEFAULTS = Object.freeze({
     apiUrl: '',
     apiKey: '',
@@ -19,6 +19,10 @@ window.MEMORY_ENGINE_SETTINGS = (function() {
     smallSummaryEveryX: 1,
     bigSummaryEveryX: 5,
     bigSummaryInjectLimit: 3,
+    // 未归档纪要注入条数上限；更早的纪要保持正文可见，不做隐藏。
+    smallSummaryInjectLimit: 10,
+    // 未归档总述积压到该数量后，把最旧的若干条合并成更早总述。
+    metaSummaryEveryX: 6,
     hideCoveredRawText: true,
     recentRawRounds: 1,
     referenceRawRounds: 1,
@@ -30,7 +34,7 @@ window.MEMORY_ENGINE_SETTINGS = (function() {
     searchDepth: 5,
     maxPerCharacter: 20,
     injectionDiceSides: 10000,
-    apiAutoRetries: 0,
+    apiAutoRetries: 1,
     nameBlacklist: '',
     filterRegex: '',
     filterUseStRegex: false,
@@ -38,16 +42,24 @@ window.MEMORY_ENGINE_SETTINGS = (function() {
     worldbookEnabled: false,
     worldbookTrigger: false,
     worldbookEjsRender: false,
-    // 用户人设参照：把酒馆「用户设定」里的 persona 描述只读喂给记忆提取 prompt（默认关闭）。
-    // 酒馆里把人设注入位置设为「不注入」时，即使本开关打开也不注入。
-    personaEnabled: false,
     syncToChat: false,
     autoBackup: false,
     backfillBatchSize: 5,
     summaryBackfillSmallEveryX: 5,
     summaryBackfillBigEveryX: 5,
     backfillRetries: 2,
-    backfillEndLayer: 0
+    backfillEndLayer: 0,
+    // 向量召回：远事纪要检索。Model 留空＝功能不启用；端点留空由主 apiUrl 推导；仅直连。
+    vectorEnabled: false,
+    vectorApiUrl: '',
+    vectorApiKey: '',
+    vectorModel: '',
+    vectorRewriteModel: '',
+    vectorRerankUrl: '',
+    vectorRerankKey: '',
+    vectorRerankModel: '',
+    vectorRecallCount: 6,
+    vectorMinScore: 35
   });
 
   let cached = null;
@@ -65,6 +77,10 @@ window.MEMORY_ENGINE_SETTINGS = (function() {
       evolveReadRounds: 1,
       manualReadRounds: 1,
       smallSummaryEveryX: 1,
+      smallSummaryInjectLimit: Math.max(1, parseInt(merged.smallSummaryInjectLimit) || 10),
+      metaSummaryEveryX: Math.max(2, parseInt(merged.metaSummaryEveryX) || 6),
+      vectorRecallCount: Math.max(1, parseInt(merged.vectorRecallCount) || 6),
+      vectorMinScore: Math.min(95, Math.max(1, parseInt(merged.vectorMinScore) || 35)),
       recentRawRounds: Math.max(0, parseInt(merged.recentRawRounds) || 0),
       referenceRawRounds: Math.max(0, parseInt(merged.referenceRawRounds) || 0),
       referenceSmallSummaryCount: Math.max(0, parseInt(merged.referenceSmallSummaryCount) || 0),

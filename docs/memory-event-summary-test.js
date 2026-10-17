@@ -95,7 +95,11 @@ Object.assign(sandbox, {
         result.personal_memory = [{ name: ['角色'], known_by: [], memory: '角色得知北方发生叛乱。', time: '' }];
         result.entity_updates = [];
       }
-      if (prompt.includes('"small_summary": ""')) result.small_summary = '角色发现城门关闭，并从守卫处得知北方发生叛乱。';
+      if (prompt.includes('"small_summary": ""')) {
+        result.small_summary = '角色发现城门关闭，并从守卫处得知北方发生叛乱。';
+        result.time_start = '2049年10月1日';
+        result.time_end = '2049年10月2日';
+      }
       if (prompt.includes('"big_summary": ""')) result.big_summary = '角色抵达城镇后发现城门关闭，并获悉北方叛乱正在影响当地。';
       return JSON.stringify(result);
     }
@@ -343,6 +347,51 @@ for (const filename of [
   assert.strictEqual(state.event_memory.small_summaries.length, 1);
   assert.strictEqual(state.event_memory.big_summary_cursor, 1);
   assert.strictEqual(state.event_memory.big_summaries.length, 1);
+  assert.strictEqual(state.event_memory.small_summaries[0].timeStart, '2049年10月1日',
+    '纪要必须落库模型返回的起止绝对时间');
+  assert.strictEqual(state.event_memory.small_summaries[0].timeEnd, '2049年10月2日');
+  assert.strictEqual(state.event_memory.big_summaries[0].timeStart, '2049年10月1日',
+    '总述未返回时间时必须从子纪要继承起止时间');
+  assert.strictEqual(state.event_memory.big_summaries[0].timeEnd, '2049年10月2日');
+
+  sandbox.MEMORY_ENGINE.applyInjection();
+  assert.ok(injectionContent.includes('[2049年10月1日 至 2049年10月2日] 角色抵达城镇后'),
+    '注入行应以时间标注替代楼层号');
+  assert.ok(!injectionContent.includes('[楼层 1-4]'), '有时间时不得再使用楼层号标注');
+
+  // 相对前缀：起止时间与故事内现在都可解析为数字日期时，注入行加「约 N 天前」。
+  sandbox.WORLD_ENGINE_CORE.parseStoryDate = text => {
+    const match = String(text || '').match(/(\d{4})年(\d{1,2})月(\d{1,2})日/);
+    if (!match) return null;
+    const [year, month, day] = [Number(match[1]), Number(match[2]), Number(match[3])];
+    return { year, month, day, total: year * 360 + month * 30 + day };
+  };
+  sandbox.WORLD_ENGINE = { parseLatestStoryDay: () => ({ total: 2049 * 360 + 10 * 30 + 12 }) };
+  sandbox.MEMORY_ENGINE.applyInjection();
+  assert.ok(injectionContent.includes('约 10 天前 · 2049年10月1日 至 2049年10月2日'),
+    '相对前缀必须叠加在绝对时间之前');
+  delete sandbox.WORLD_ENGINE;
+  delete sandbox.WORLD_ENGINE_CORE.parseStoryDate;
+  sandbox.MEMORY_ENGINE.applyInjection();
+  assert.ok(!injectionContent.includes('约 10 天前'), '解析器不可用时相对前缀必须静默缺席');
+
+  // 『』标签兜底：模型不返回 time 字段时，从待总结正文标签抓起止区间。
+  {
+    const tagCallApi = sandbox.WORLD_ENGINE_API.callApi;
+    sandbox.WORLD_ENGINE_API.callApi = async () => JSON.stringify({ small_summary: '标签兜底纪要。' });
+    sandbox.MEMORY_ENGINE_DATA.saveState(sandbox.MEMORY_ENGINE_DATA.defaultState());
+    chat[2].mes = '发现城门已经关闭。『2049年丨10月丨1日丨清晨』';
+    chat[4].mes = '守卫说明北方发生叛乱。『2049年丨10月丨2日丨夜间』';
+    await sandbox.MEMORY_ENGINE.manualSmallSummary();
+    sandbox.WORLD_ENGINE_API.callApi = tagCallApi;
+    const tagState = sandbox.MEMORY_ENGINE_DATA.loadState();
+    assert.strictEqual(tagState.event_memory.small_summaries[0].timeStart, '2049年 10月 1日',
+      '模型缺时间时必须从正文『』标签兜底');
+    assert.strictEqual(tagState.event_memory.small_summaries[0].timeEnd, '2049年 10月 2日',
+      '『』标签的第 4 段时刻应丢弃，只保留年月日');
+    chat[2].mes = '发现城门已经关闭。';
+    chat[4].mes = '守卫说明北方发生叛乱。';
+  }
   const checkpointAfterCombined = sandbox.MEMORY_ENGINE_DATA.loadCheckpoint();
   assert.strictEqual(checkpointAfterCombined.event_memory.small_summaries.length, 0,
     '链式大总结不得覆盖小总结请求之前建立的 checkpoint');
@@ -372,6 +421,23 @@ for (const filename of [
   state = sandbox.MEMORY_ENGINE_DATA.loadState();
   assert.strictEqual(JSON.stringify(state.event_memory), summaryBeforePersonBackfill, '人物实体回填不得清理大小总结');
   assert.ok(state.personal_memory.some(item => item.names.includes('角色')));
+
+  // 批量重填整批失败时降级为逐轮提取：批请求（同时覆盖两轮正文）失败，逐轮请求成功。
+  {
+    const baseCallApi = sandbox.WORLD_ENGINE_API.callApi;
+    sandbox.WORLD_ENGINE_API.callApi = async prompt => {
+      if (prompt.includes('进入城镇') && prompt.includes('叛乱')) throw new Error('批量请求失败');
+      return baseCallApi(prompt);
+    };
+    calls.length = 0;
+    await sandbox.MEMORY_ENGINE.backfill();
+    sandbox.WORLD_ENGINE_API.callApi = baseCallApi;
+    const degradedState = sandbox.MEMORY_ENGINE_DATA.loadState();
+    assert.ok(degradedState.personal_memory.some(item => item.names.includes('角色')),
+      '批量失败后逐轮重填必须补齐全部轮次');
+    assert.ok(degradedState.timeline.nodes.filter(node => node.kind === 'memory' && node.status === 'valid').length >= 2,
+      '逐轮降级必须产出独立的逐轮记忆节点');
+  }
 
   state.event_memory.big_summary_cursor = Math.max(0, state.event_memory.small_summaries.length - 1);
   sandbox.MEMORY_ENGINE_DATA.saveState(state);
@@ -503,7 +569,24 @@ for (const filename of [
   sandbox.MEMORY_ENGINE_DATA.saveState(sandbox.MEMORY_ENGINE_DATA.defaultState());
   calls.length = 0;
   runningLabels.length = 0;
-  settings.evolveEveryX = 999;
+  // 末段事件驱动的自动提取走真实来源引用：captureRange 产出稳定 refs，
+  // auditRefs 恒定有效，避免对账把上一轮提取误判成失效来源。
+  sandbox.MEMORY_ENGINE_TIMELINE = {
+    hashText() { return 'hash'; },
+    captureRange(start, end) {
+      const refs = [];
+      for (let layer = start; layer <= end; layer++) {
+        refs.push({ chatId: 'summary-test', messageId: `floor-${layer}`, layer, role: chat[layer]?.is_user ? 'user' : 'ai', swipeId: 0, hash: 'stable' });
+      }
+      return refs;
+    },
+    digestRefs(refs) { return (refs || []).map(ref => `${ref.chatId}:${ref.messageId}`).join('|'); },
+    auditRefs(refs) { return { valid: true, refs, changed: [], missing: [] }; },
+    unionRefs(groups) { return (groups || []).flat(); },
+    syncHidden() { return Promise.resolve(); },
+    refsToConversation(refs) { return (refs || []).map(ref => `[楼层 ${ref.layer}] 正文`).join('\n\n'); },
+    ensureMessageId(message) { return message.id || 'id'; }
+  };
   sandbox.MEMORY_ENGINE.init();
   let initializedState = sandbox.MEMORY_ENGINE_DATA.loadState();
   assert.strictEqual(initializedState.event_memory.small_summary_layer, chat.length - 1,
@@ -515,7 +598,13 @@ for (const filename of [
   );
   listeners.get('generation_ended')();
   await new Promise(resolve => setTimeout(resolve, 1600));
-  assert.strictEqual(calls.length, 0, '进入已有聊天后新增不足 X 轮时不得自动补历史纪要');
+  assert.strictEqual(calls.length, 2, '基线之后新增一轮即从最老缺口提取：人物实体与纪要合并请求，再独立生成总述');
+  assert.ok(calls[0].includes('"personal_memory": []') && calls[0].includes('"small_summary": ""'),
+    '自动提取按轮配对人物实体与纪要，不允许只补纪要漏掉人物实体');
+  assert.ok(!calls[0].includes('这是角色卡的开场白'), '自动提取的缺口扫描必须忽略第 0 层 AI 开场白');
+  assert.ok(calls[1].includes('"big_summary": ""'));
+  assert.ok(!calls[1].includes('"personal_memory": []'));
+  assert.deepStrictEqual(runningLabels.slice(0, 2), ['人物、实体与纪要', '总述']);
 
   chat.push(
     { is_user: true, name: '用户', mes: '准备返回旅店。' },
@@ -523,13 +612,10 @@ for (const filename of [
   );
   listeners.get('generation_ended')();
   await new Promise(resolve => setTimeout(resolve, 1600));
-  assert.strictEqual(calls.length, 2, '从进入聊天的基线起新增满 X 轮后，才生成纪要并独立生成总述');
-  assert.ok(calls[0].includes('"small_summary": ""'));
-  assert.ok(!calls[0].includes('"personal_memory": []'));
-  assert.ok(!calls[0].includes('事件记忆的总述整理器'));
-  assert.ok(calls[1].includes('"big_summary": ""'));
-  assert.ok(!calls[1].includes('"personal_memory": []'));
-  assert.deepStrictEqual(runningLabels, ['纪要', '总述']);
+  assert.strictEqual(calls.length, 4, '后续每新增一轮继续按缺口提取并独立生成总述');
+  assert.ok(calls[2].includes('"personal_memory": []') && calls[2].includes('"small_summary": ""'));
+  assert.ok(calls[3].includes('"big_summary": ""'));
+  assert.deepStrictEqual(runningLabels, ['人物、实体与纪要', '总述', '人物、实体与纪要', '总述']);
 
   console.log('✓ 事件记忆大小总结测试通过');
 })().catch(error => {

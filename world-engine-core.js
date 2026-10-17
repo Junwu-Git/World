@@ -109,7 +109,7 @@ window.WORLD_ENGINE_CORE = (function() {
   // world-engine-worldbook.js 取 substituteParams 同款路子）。power_user.persona_description
   // 是酒馆核心自己用于注入的单一字段，切换/编辑 persona 时由核心同步，读它即当前人设。
   // persona_description_position === NONE(9) 表示用户在酒馆里主动关闭了人设注入，
-  // 此时即使本扩展开关打开也不注入，尊重用户选择。
+  // 此时本扩展也不注入，尊重用户选择。
   let powerUserModulePromise = null;
   function getPowerUserModule() {
     if (!powerUserModulePromise) {
@@ -147,9 +147,8 @@ window.WORLD_ENGINE_CORE = (function() {
     return `========== 用户人设（{{user}} 的角色设定）==========\n${body}\n\n（以上是幕后世界中以「{{user}}」身份参与剧情的人物设定。推演涉及{{user}}的地位、权力、能力、人际网络与行为倾向时以本设定为准；设定未覆盖的细节保持中性，不得凭空夸大或弱化{{user}}。）`;
   }
 
-  // 构建「用户人设」prompt 段。enabled=false、人称为空、position=NONE 或读取失败时返回 ''。
-  async function buildPersonaSection(enabled) {
-    if (enabled !== true) return '';
+  // 构建「用户人设」prompt 段（默认行为，无开关）。人称为空、position=NONE 或读取失败时返回 ''。
+  async function buildPersonaSection() {
     const persona = await getPersonaDescription();
     if (!persona || !persona.description) return '';
     if (persona.position === 9) return ''; // NONE：用户在酒馆关闭了人设注入
@@ -748,8 +747,12 @@ window.WORLD_ENGINE_CORE = (function() {
   //   位置渐变加分（越靠后越可能是当前时间，最多 +30）；仅月日候选再扣一点。
   //   同分取更靠后的（保持「取最后一个」的兜底方向）。
   // 思维链/HTML 注释先整块删掉（think 极爱复述旧日期）。全角归一化逐字符 1:1 替换，不改变长度。
+  // 思维链标签名放宽到 <think…> 的任意变体（think_nya~ / think_cot / thinking…）：
+  //   只认 <think>/<thinking> 时，人设自定义的思维链标签整块留下，里面的旧日期会混进候选池。
+  //   用基础名 + 尾缀放宽的写法（不能加 \b：「~」是非单词字符，<think_nya~> 会被边界判掉）。
   // 返回 { year, month, day, total, source, clock, candidateCount }；解析不到返回 null。
   //   source: 'text'（完整日期） | 'text-md'（仅月日，年份继承）
+  const THINK_BLOCK_RE = /<(think(?:ing)?)[^>]*>[\s\S]*?<\/\1[^>]*>/gi;
   const CN_DIGITS = { 零: 0, 〇: 0, 一: 1, 二: 2, 两: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9 };
   // 逐位中文数字（二〇二五 → 2025）：年份专用；月/日是位值记法（十月=10），走 cnToNum
   function cnDigitsToNum(s) {
@@ -787,7 +790,7 @@ window.WORLD_ENGINE_CORE = (function() {
   function parseStoryDate(rawText) {
     if (!rawText) return null;
     const text = normalizeDateChars(rawText)
-      .replace(/<think(?:ing)?\b[\s\S]*?<\/think(?:ing)?>/gi, ' ')
+      .replace(THINK_BLOCK_RE, ' ')
       .replace(/<!--[\s\S]*?-->/g, ' ');
     if (!text.trim()) return null;
 

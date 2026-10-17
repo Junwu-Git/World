@@ -31,6 +31,7 @@ window.MEMORY_ENGINE_DATA = (function() {
       knowledge_index: clone(state?.knowledge_index || {}),
       entity_memory: clone(state?.entity_memory || emptyEntityMemory()),
       entity_index: clone(state?.entity_index || {}),
+      npc_profiles: clone(state?.npc_profiles || []),
       round: Math.max(0, parseInt(state?.round) || 0),
       chatLayer: state?.chatLayer !== null && Number.isFinite(Number(state?.chatLayer)) ? Number(state.chatLayer) : null
     };
@@ -58,6 +59,7 @@ window.MEMORY_ENGINE_DATA = (function() {
       knowledge_index: {},
       entity_memory: emptyEntityMemory(),
       entity_index: {},
+      npc_profiles: [],
       event_memory: {
         small_summaries: [],
         big_summaries: [],
@@ -115,6 +117,9 @@ window.MEMORY_ENGINE_DATA = (function() {
         startLayer: Number.isFinite(Number(item?.startLayer)) ? Number(item.startLayer) : 0,
         endLayer: Number.isFinite(Number(item?.endLayer)) ? Number(item.endLayer) : 0,
         content: String(item?.content || '').trim(),
+        // 本段起止的绝对故事时间（文本透传，架空纪年也允许）；未知为空串。
+        timeStart: clean(item?.timeStart),
+        timeEnd: clean(item?.timeEnd),
         sourceRefs: Array.isArray(item?.sourceRefs) ? clone(item.sourceRefs) : [],
         sourceDigest: clean(item?.sourceDigest),
         originChatId: clean(item?.originChatId),
@@ -136,6 +141,10 @@ window.MEMORY_ENGINE_DATA = (function() {
       startLayer: Number.isFinite(Number(item?.startLayer)) ? Number(item.startLayer) : 0,
       endLayer: Number.isFinite(Number(item?.endLayer)) ? Number(item.endLayer) : 0,
       content: String(item?.content || '').trim(),
+      // level 1 = 由纪要合并；2 = 更早总述；3 = 最早总述（childIds 指向上一层）。非法值按 1。
+      level: Number(item?.level) >= 2 && Number(item?.level) <= 3 ? Number(item.level) : 1,
+      timeStart: clean(item?.timeStart),
+      timeEnd: clean(item?.timeEnd),
       childIds: Array.isArray(item?.childIds) ? item.childIds.map(String) : [],
       childDigest: clean(item?.childDigest),
       sourceRefs: Array.isArray(item?.sourceRefs) ? clone(item.sourceRefs) : [],
@@ -153,6 +162,16 @@ window.MEMORY_ENGINE_DATA = (function() {
       Math.max(0, parseInt(next.event_memory.big_summary_cursor) || 0)
     );
     next.round = Math.max(0, parseInt(next.round) || 0);
+    // 人物当前状态档案：location=所在位置、condition=当前处境、stance=对主角外在态度，全部自由文本。
+    if (!Array.isArray(next.npc_profiles)) next.npc_profiles = [];
+    next.npc_profiles = next.npc_profiles.map((item, index) => ({
+      id: String(item?.id || `npc_${String(index + 1).padStart(6, '0')}`),
+      names: unique(Array.isArray(item?.names) ? item.names : [item?.names]),
+      location: clean(item?.location),
+      condition: clean(item?.condition),
+      stance: clean(item?.stance),
+      sourceDigest: clean(item?.sourceDigest)
+    })).filter(item => item.names.length);
     next.chatLayer = next.chatLayer !== null && next.chatLayer !== '' && Number.isFinite(Number(next.chatLayer))
       ? Number(next.chatLayer) : null;
     if (!next.timeline || typeof next.timeline !== 'object' || Array.isArray(next.timeline)) {
@@ -184,6 +203,7 @@ window.MEMORY_ENGINE_DATA = (function() {
           sourceDigest: clean(node?.sourceDigest),
           personal: Array.isArray(node?.personal) ? clone(node.personal) : [],
           entities: node?.entities && typeof node.entities === 'object' ? clone(node.entities) : emptyEntityMemory(),
+          npcs: Array.isArray(node?.npcs) ? clone(node.npcs) : [],
           snapshot: node?.snapshot && typeof node.snapshot === 'object' ? memoryBaseFrom(node.snapshot) : null,
           status: ['valid', 'stale', 'pending', 'failed'].includes(node?.status) ? node.status : 'valid',
           revision: Math.max(1, parseInt(node?.revision) || 1),

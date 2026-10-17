@@ -12,19 +12,35 @@ window.MEMORY_ENGINE_BIG_SUMMARY_PROMPT = (function() {
 
 严格遵守用户消息给出的【本次篇幅】：正文至少 500 字，最多不超过本批全部纪要正文总字数的一半；若计算所得的一半少于 500 字，则本次上下限都按 500 字执行。汉字、数字、字母均计入字数。先组织完整内容再输出，不得靠重复、空话凑字，也不得生硬截断。
 
+【时间字段规则】
+time_start 与 time_end 分别记录本阶段的起止绝对故事时间，只能来自输入条目自带的时间标注（含各条目的起止时间），不得自行补日期或推算；输入条目都没有时间时两个字段都留空字符串。
+
 【本任务输出字段】
-返回 big_summary 字符串字段。`;
+返回 big_summary、time_start、time_end 三个字段。`;
 
   const clean = value => String(value == null ? '' : value).trim();
 
+  // 输入行标注：时间优先，无时间回退楼层号。
+  const timeLabel = item => {
+    const start = clean(item?.timeStart), end = clean(item?.timeEnd);
+    const range = start && end && start !== end ? `${start} 至 ${end}` : (start || end);
+    return range || `楼层 ${Number(item?.startLayer) || 0}-${Number(item?.endLayer) || 0}`;
+  };
+
   function buildUserPrompt(options) {
     const input = options || {};
+    // level ≥ 2：输入是既有总述而非原始纪要，要求合并成更高一层的总览。
+    const isMeta = Number(input.level) >= 2;
     const records = Array.isArray(input.summaries) ? input.summaries : [];
     const sourceLength = records.reduce((total, item) => total + clean(item?.content).length, 0);
     const maxLength = Math.max(500, Math.ceil(sourceLength / 2));
-    return `【本次篇幅】\n总述正文不少于 500 字、不超过 ${maxLength} 字。\n\n【待整理的阶段纪要】\n${records.length ? records.map((item, index) =>
-      `${index + 1}. [楼层 ${Number(item?.startLayer) || 0}-${Number(item?.endLayer) || 0}] ${clean(item?.content)}`
-    ).join('\n') : '（暂无）'}`;
+    const inputHeader = isMeta ? '【待合并的既有总述】' : '【待整理的阶段纪要】';
+    const metaNote = isMeta
+      ? '\n\n本次输入是既有总述而非原始纪要：按同样的规则把它们合并成更早期的总览，只压缩与重组输入内容，不得虚构输入之外的细节。'
+      : '';
+    return `【本次篇幅】\n总述正文不少于 500 字、不超过 ${maxLength} 字。\n\n${inputHeader}\n${records.length ? records.map((item, index) =>
+      `${index + 1}. [${timeLabel(item)}] ${clean(item?.content)}`
+    ).join('\n') : '（暂无）'}${metaNote}`;
   }
 
   return { SYSTEM_PROMPT, buildUserPrompt };

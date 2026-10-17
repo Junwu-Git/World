@@ -2,7 +2,7 @@
 // 等价重放 world-engine.js 的 onGenerationStarted(type,opts,dryRun) → applyInjectionForCurrentRound(opts)
 // 与 evolution.js evolve() 基底/轮次三分（后者 v2.3.18 已验证，这里复跑回归保护）。
 
-const assert = require('assert');
+import assert from 'node:assert';
 
 // ───────── onGenerationStarted：把酒馆 type/dryRun 翻译成 isReroll / 是否跳过 ─────────
 // 复刻自 world-engine.js onGenerationStarted

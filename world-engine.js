@@ -14,6 +14,26 @@
     }
   };
 
+  // 错误历史（环形，最近 50 条）：守卫捕获的引擎异常在此聚合，供诊断导出与调试卡展示；
+  // console 照常输出，这里只做「用户可查」的留存。记忆引擎守卫复用 GUARD_EVENT，自动纳入。
+  window.WORLD_ENGINE_ERROR_LOG = (function() {
+    const MAX = 50;
+    const items = [];
+    return {
+      push(engineLabel, eventLabel, error) {
+        items.push({
+          time: new Date().toISOString(),
+          engine: String(engineLabel || ''),
+          event: String(eventLabel || ''),
+          message: (error && (error.stack || error.message)) || String(error)
+        });
+        if (items.length > MAX) items.shift();
+      },
+      list: () => items.slice(),
+      clear: () => { items.length = 0; }
+    };
+  })();
+
   // 所有引擎共用同一事件故障边界：同步异常与异步 rejection 都只记到所属引擎。
   window.WORLD_ENGINE_GUARD_EVENT = function(engineLabel, eventLabel, handler) {
     return function(...args) {
@@ -22,11 +42,13 @@
         if (result && typeof result.then === 'function') {
           return result.catch(error => {
             console.error(`[${engineLabel}] ${eventLabel}事件处理失败`, error);
+            window.WORLD_ENGINE_ERROR_LOG?.push(engineLabel, eventLabel, error);
           });
         }
         return result;
       } catch (error) {
         console.error(`[${engineLabel}] ${eventLabel}事件处理失败`, error);
+        window.WORLD_ENGINE_ERROR_LOG?.push(engineLabel, eventLabel, error);
       }
     };
   };
@@ -43,7 +65,7 @@
   const SHARED_CONTRACTS = {
     WORLD_ENGINE_STORE: ['hydrate', 'getItem', 'setItem'],
     WORLD_ENGINE_CORE: ['getChatId', 'loadState'],
-    WORLD_ENGINE_API: ['callApi'],
+    WORLD_ENGINE_API: ['callApi', 'callEmbeddings', 'callRerank'],
     WORLD_ENGINE_BRIDGE: ['buildBridgeSection', 'buildHistorySection'],
     WORLD_ENGINE_WORLDBOOK: ['buildPromptSection'],
     WORLD_ENGINE_CHATCACHE: ['init'],
@@ -73,6 +95,7 @@
         'memory-engine-settings.js',
         'memory-engine-data.js',
         'memory-engine-timeline.js',
+        'memory-engine-vector.js',
         'memory-engine-prompt.js',
         'memory-engine-small-summary-prompt.js',
         'memory-engine-big-summary-prompt.js',
@@ -82,6 +105,7 @@
         MEMORY_ENGINE_SETTINGS: ['getSettings', 'patchSettings'],
         MEMORY_ENGINE_DATA: ['loadState', 'saveState'],
         MEMORY_ENGINE_TIMELINE: ['captureRange', 'auditRefs', 'syncHidden'],
+        MEMORY_ENGINE_VECTOR: ['recallForGeneration', 'getLastRecall', 'scheduleIndexUpdate', 'rebuildIndex', 'getVectorStatus'],
         MEMORY_ENGINE_PROMPT: ['buildUserPrompt'],
         MEMORY_ENGINE_SMALL_SUMMARY_PROMPT: ['buildUserPrompt'],
         MEMORY_ENGINE_BIG_SUMMARY_PROMPT: ['buildUserPrompt'],
@@ -90,7 +114,7 @@
     }
   ];
 
-  const SHARED_UI_MODULES = ['world-engine-diag.js', 'world-engine-ui.js'];
+  const SHARED_UI_MODULES = ['world-engine-ui-ball.js', 'world-engine-diag.js', 'world-engine-ui.js'];
   const SHARED_UI_CONTRACTS = {
     WORLD_ENGINE_DIAG: ['collect', 'download'],
     WORLD_ENGINE_UI: ['buildPanel', 'buildInputButton', 'refresh']
@@ -574,7 +598,10 @@
             // isEvolving 继续作为内部互斥锁保持 true，防止联动期间再次启动世界推演；
             // UI 运行态则在这里结束，让两个引擎的动画严格按先后阶段显示。
             if (isNewRound || opts.forceApplyInjection) applyInjection();
-            setStatus('世界推演完成');
+            const trimmedInfo = evolution.getPromptTrimmed ? evolution.getPromptTrimmed() : null;
+            setStatus(trimmedInfo
+              ? `世界推演完成（提示词超预算已裁剪：${trimmedInfo.sections.map(s => s.label).join('、')}）`
+              : '世界推演完成');
             if (ui) { ui.setEvolvingUI(false); ui.refresh(true); }
             worldUiPhaseFinished = true;
             if (settings.memoryLinkEnabled === true) {
@@ -753,6 +780,31 @@
         applyInjectionForCurrentRound({ isReroll: true });
       }
 
+      // 删除楼层：层数回退会改变「当前层 vs 状态层」的关系（删到旧层 → 应注入存档点），
+      // 也可能让正在跑的推演把已删内容写进世界状态。立即中止 + 重选注入，不等下一次 CHAT_LOADED/生成。
+      function onMessageDeleted() {
+        clearAutoEvolveTimer();
+        if (evolution && evolution.isRunning && evolution.isRunning()) {
+          try { evolution.abort(); console.log('[世界引擎] 删除楼层，中止进行中的推演/回填'); } catch (e) { console.warn('[世界引擎] 中止推演失败', e); }
+        }
+        // 三级锚点的最后一级（fingerprint）若指向已不存在的层，收回当前层，
+        // 避免删楼后计数 c=(L-anchor)/2 出现死区（补齐被删层数之前永不推演）。
+        // state.chatLayer / checkpoint.chatLayer 不动：注入侧靠「state 层 > 当前层」选存档点，拉低会破坏重 roll 语义。
+        const currentLayer = core.getChatLayer();
+        const savedFingerprint = Number(core.loadFingerprint());
+        if (Number.isFinite(savedFingerprint) && savedFingerprint > currentLayer) {
+          core.saveFingerprint(String(currentLayer));
+        }
+        applyInjectionForCurrentRound();
+      }
+
+      // 编辑楼层：长度不变不影响层数锚点，但最近 5 楼文本变了 → 注入里的说话人 tags 过期。
+      // 重算一次注入（面板 refresh 也随之完成）。
+      function onMessageEdited() {
+        clearAutoEvolveTimer();
+        applyInjectionForCurrentRound();
+      }
+
       // 借用生成开始事件作为正文组装时机。重 roll 判据用酒馆原生 type（swipe/regenerate），
       // 不再用 chatLayer 数值——因为 GENERATION_STARTED 在用户/AI 楼 push 进 chat 之前 emit，
       // 新一轮发消息时 chatLayer 仍 == 上一轮 state.chatLayer，纯数值判据会把新轮首生成误判成重 roll（v2.3.18 回归）。
@@ -766,26 +818,45 @@
 
       // 柏宝书时间标签解析（按时间模式「自动回填」用）：从最新 AI 楼的 <bbs_end>…</bbs_end>
       // 提取 YYYY/M/D（含时刻），按 年×360 + 月×30 + 日 换算总天数（与按时间设置默认乘数口径一致）。
-      // 读原始 mes——柏宝书的隐藏正则只作用于显示层，标签仍在原文里。从聊天末尾往前扫，
-      // 一楼多标签取最后一个（与 parseStoryDay「取最后一个匹配」语义一致：剧情结束时刻）。
+      // 读原始 mes——柏宝书的隐藏正则只作用于显示层，标签仍在原文里。从聊天末尾往前扫。
+      // 配对用「最后一个 </bbs_end> 闭标签 + 它前面最近的一个 <bbs_end> 开标签」，取语义上的剧情结束时刻：
+      //   模型思维链常裸写格式说明（「要加完整的时间锚点 <bbs_start> 和 <bbs_end>」），非贪婪
+      //   正则会从提及处一路吃到真正的闭标签，再把段内第一个日期（往往是 <bbs_start> 的开始
+      //   时刻）当成结束时刻——同日只错时刻，跨午夜还会错天；若提及处自带一对无日期的标签，
+      //   整楼还会被当成「有标签但无日期」而跳过。按闭标签倒序配对天然免疫。
+      // 思维链（含 <think_nya~> 等自定义变体）与 HTML 注释先整块剥离，避免其中复述的旧时间入选。
       // 标签是插件生成的机器格式，日期用阿拉伯数字；正文里的多种日期写法走 parseLatestStoryDay。
       // 找不到标签或日期字段时返回 null。
       function parseBaiBaiEndDay(chat) {
-        const tagRe = /<bbs_end\s*>([\s\S]*?)<\/bbs_end\s*>/i;
-        const dateRe = /(\d{4})\s*[/\-年]\s*(\d{1,2})\s*[/\-月]\s*(\d{1,2})/;
+        const thinkRe = /<(think(?:ing)?)[^>]*>[\s\S]*?<\/\1[^>]*>/gi;
+        const openRe = /<bbs_end\b[^>]*>/gi;
+        const closeRe = /<\/bbs_end\s*>/gi;
+        const dateRe = /(\d{4})\s*[/\-年.]\s*(\d{1,2})\s*[/\-月.]\s*(\d{1,2})/;
         for (let i = (Array.isArray(chat) ? chat.length : 0) - 1; i >= 0; i--) {
           const m = chat[i];
           if (!m || m.is_user || m.is_system) continue;
-          const tagHit = String(m.mes || '').match(tagRe);
-          if (!tagHit) continue;
-          const dm = String(tagHit[1] || '').match(dateRe);
-          if (!dm) continue;
+          const text = String(m.mes || '')
+            .replace(thinkRe, ' ')
+            .replace(/<!--[\s\S]*?-->/g, ' ');
+          const closes = Array.from(text.matchAll(closeRe));
+          if (!closes.length) continue;
+          let inner = null, dm = null;
+          // 闭标签从后往前：最后一个能配出日期的配对即结束时刻（最后那对无日期时退到前一对）
+          for (let k = closes.length - 1; k >= 0 && !dm; k--) {
+            const opens = Array.from(text.slice(0, closes[k].index).matchAll(openRe));
+            if (!opens.length) continue;
+            const open = opens[opens.length - 1];
+            const body = text.slice(open.index + open[0].length, closes[k].index);
+            dm = body.match(dateRe);
+            if (dm) inner = body;
+          }
+          if (!inner) continue;
           const year = parseInt(dm[1], 10);
           const month = parseInt(dm[2], 10);
           const day = parseInt(dm[3], 10);
           if (!Number.isFinite(year) || !Number.isFinite(month) || !Number.isFinite(day)) continue;
           // 时刻（结束时刻语义）：取日期之后的第一处「HH:MM / 下午 / 深夜」类线索，仅用于展示
-          const rest = String(tagHit[1] || '').slice(dm.index + dm[0].length);
+          const rest = inner.slice(dm.index + dm[0].length);
           const clockM = rest.match(/(\d{1,2}\s*[:：]\s*\d{2}|凌晨|清晨|早晨|上午|中午|下午|傍晚|黄昏|晚上|深夜|午夜|子夜|黎明|拂晓)/);
           return { year, month, day, total: year * 360 + month * 30 + day, floor: i, source: 'baibai-tag', clock: clockM ? clockM[1].replace(/\s+/g, '') : null };
         }
@@ -816,6 +887,8 @@
         ctx.eventSource.on(autoEvolveEvent, guard('世界引擎', '生成完成', onMessageReceived));
         ctx.eventSource.on(ctx.event_types?.CHAT_LOADED || 'chat_loaded', guard('世界引擎', '聊天加载', onChatLoaded));
         ctx.eventSource.on(ctx.event_types?.MESSAGE_SWIPED || 'message_swiped', guard('世界引擎', '滑动重生成', onMessageSwiped));
+        ctx.eventSource.on(ctx.event_types?.MESSAGE_DELETED || 'message_deleted', guard('世界引擎', '删除消息', onMessageDeleted));
+        ctx.eventSource.on(ctx.event_types?.MESSAGE_EDITED || 'message_edited', guard('世界引擎', '编辑消息', onMessageEdited));
         ctx.eventSource.on(ctx.event_types?.GENERATION_STARTED || 'generation_started', guard('世界引擎', '生成开始', onGenerationStarted));
         console.log('[世界引擎] 事件绑定成功，自动推演事件:', autoEvolveEvent);
       } else {

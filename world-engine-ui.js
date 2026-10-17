@@ -14,6 +14,7 @@ window.WORLD_ENGINE_UI = (function() {
   let _memorySelectedNavView = null;
   let _memoryEditingPerson = null;
   let _memoryEditingEntity = null;
+  let _memoryEditingNpc = null;
   let _memoryEditingSmall = null;
   let _memoryEditingBig = null;
   const _memoryCollapsedRecords = new Set();
@@ -47,6 +48,8 @@ window.WORLD_ENGINE_UI = (function() {
   let _wbScrollTop = 0;
   // 全局排除搜索词（模块级，跨 refresh() 存活，避免重渲染时丢输入）
   let _wbExclSearch = '';
+  // 后台刷新空转跳过：记录上次重建的数据签名，未变化则不重建 DOM
+  let _lastRefreshSig = null;
 
   // 引擎面扩展点：新增引擎按注册顺序进入“下一界面”循环。
   // 可提供 render/bind、主题/版本、设置、运行状态、球体 class 与卫星按钮动作等钩子。
@@ -94,10 +97,7 @@ window.WORLD_ENGINE_UI = (function() {
       getVersion: () => window.WORLD_ENGINE_VERSION,
       getSettings: () => window.WORLD_ENGINE_API?.getSettings(true) || {},
       setEnabled: enabled => {
-        const api = window.WORLD_ENGINE_API;
-        const current = api?.getSettings?.(true) || {};
-        window.WORLD_ENGINE_STORE.setItem('world_engine_settings', JSON.stringify({ ...current, engineEnabled: enabled }));
-        api?.getSettings?.(true);
+        window.WORLD_ENGINE_API?.patchSettings?.({ engineEnabled: enabled });
         window.WORLD_ENGINE?.applyInjection?.();
       },
       isRunning: () => Boolean(_evolving),
@@ -429,6 +429,7 @@ window.WORLD_ENGINE_UI = (function() {
     const settings = window.MEMORY_ENGINE_SETTINGS?.getSettings?.(true) || {};
     const rows = [
       { view: 'people', label: '人物', sub: '人物记忆 · 别名 · 时间', poem: '知人者智' },
+      { view: 'npcs', label: '人物状态', sub: '位置 · 处境 · 外在态度', poem: '察言而观行' },
       { view: 'entities', label: '实体', sub: '组织 · 物件 · 能力 · 地点', poem: '名者，实之宾也' },
       { view: 'minutes', label: '纪要', sub: '阶段纪要 · 楼层范围', poem: '纪事者必提其要' },
       { view: 'overview', label: '总述', sub: '阶段总述 · 全局脉络', poem: '壹引其纲，万目皆张' }
@@ -452,6 +453,7 @@ window.WORLD_ENGINE_UI = (function() {
 
   const MEMORY_VIEW_META = {
     people: { title: '人物', poem: '知人者智' },
+    npcs: { title: '人物状态', poem: '察言而观行' },
     entities: { title: '实体', poem: '名者，实之宾也' },
     minutes: { title: '纪要', poem: '纪事者必提其要' },
     overview: { title: '总述', poem: '壹引其纲，万目皆张' }
@@ -584,22 +586,62 @@ window.WORLD_ENGINE_UI = (function() {
     return `<div class="we-memory-page-actions"><button class="we-btn we-btn-primary" id="we-memory-add-entity" type="button"><i class="fa-solid fa-plus"></i> 新增实体</button></div>${draft}${groups}`;
   }
 
+  function renderMemoryNpcEditor(profile, isNew) {
+    return `<div class="we-memory-editor" data-npc-editor data-npc-id="${h(profile?.id || '')}" data-new="${isNew ? 'true' : 'false'}">
+      <div class="we-input-group"><label>名称（用 / 分隔，首个为主名）</label><input class="we-memory-npc-names" type="text" value="${h((profile?.names || []).join(' / '))}" placeholder="例如：守卫队长 / 老陈"></div>
+      <div class="we-input-group"><label>所在位置</label><input class="we-memory-npc-location" type="text" value="${h(profile?.location || '')}" placeholder="此刻在哪里，可留空"></div>
+      <div class="we-input-group"><label>当前处境</label><input class="we-memory-npc-condition" type="text" value="${h(profile?.condition || '')}" placeholder="正在做什么，可留空"></div>
+      <div class="we-input-group"><label>对主角的外在态度</label><input class="we-memory-npc-stance" type="text" value="${h(profile?.stance || '')}" placeholder="可观察的语气与举动，可留空"></div>
+      <div class="we-memory-editor-actions"><button class="we-btn we-memory-cancel-edit" type="button">取消</button><button class="we-btn we-btn-primary we-memory-save-npc" type="button">保存</button></div>
+    </div>`;
+  }
+
+  function renderMemoryNpcProfiles(state) {
+    const items = Array.isArray(state.npc_profiles) ? state.npc_profiles : [];
+    const draft = _memoryEditingNpc === '__new__'
+      ? `<div class="we-memory-record we-memory-record-new">${renderMemoryNpcEditor({ id: '', names: [] }, true)}</div>` : '';
+    const cards = items.map(profile => {
+      const collapseKey = `npc:${profile.id}`;
+      const summary = [
+        profile.location ? `位置：${profile.location}` : '',
+        profile.condition ? `处境：${profile.condition}` : '',
+        profile.stance ? `态度：${profile.stance}` : ''
+      ].filter(Boolean).join('；');
+      return `<div class="${memoryRecordClass(collapseKey)}" data-npc-id="${h(profile.id)}">
+        <div class="we-memory-record-head" data-memory-collapse-key="${h(collapseKey)}" role="button" tabindex="0"><div><div class="we-memory-record-title">${h(profile.names?.[0] || '未命名')}</div><div class="we-memory-record-meta">${h((profile.names || []).slice(1).join(' · ') || summary || profile.id)}</div></div>
+          <div class="we-memory-record-actions">${memoryRecordToggle(collapseKey)}<button class="we-icon-btn we-memory-edit-npc" type="button" title="编辑"><i class="fa-solid fa-pen"></i></button><button class="we-icon-btn we-memory-delete-npc" type="button" title="删除"><i class="fa-solid fa-trash"></i></button></div>
+        </div>
+        ${memoryRecordBody(collapseKey, _memoryEditingNpc === profile.id ? renderMemoryNpcEditor(profile, false) : `<div class="we-memory-description">${h(summary || '暂无状态记录')}</div>`)}
+      </div>`;
+    }).join('');
+    return `<div class="we-memory-page-actions"><button class="we-btn we-btn-primary" id="we-memory-add-npc" type="button"><i class="fa-solid fa-plus"></i> 新增人物状态</button></div>${draft}${cards || '<div class="we-empty">暂无人物状态，可手动新增。</div>'}`;
+  }
+
+  function memoryTimeRangeLabel(item) {
+    const start = String(item?.timeStart ?? '').trim();
+    const end = String(item?.timeEnd ?? '').trim();
+    if (start && end && start !== end) return `${start} 至 ${end}`;
+    return start || end;
+  }
+
   function renderMemoryMinutes(state) {
     const eventMemory = state.event_memory || {};
     const items = Array.isArray(eventMemory.small_summaries) ? eventMemory.small_summaries : [];
     const cursor = Math.max(0, Math.min(items.length, parseInt(eventMemory.big_summary_cursor) || 0));
     const editor = (item, isNew) => `<div class="we-memory-editor">
       <div class="we-memory-form-grid"><div class="we-input-group"><label>起始楼层</label><input class="we-memory-small-start" type="number" min="0" value="${h(String(item.startLayer ?? 0))}"></div><div class="we-input-group"><label>结束楼层</label><input class="we-memory-small-end" type="number" min="0" value="${h(String(item.endLayer ?? 0))}"></div></div>
-      <div class="we-input-group"><label>纪要内容</label><textarea class="we-memory-small-content" rows="6">${h(item.content || '')}</textarea><div class="we-hint">API 以 50–200 字为目标，超出时仍完整保留；手动新增的纪要只会追加为未整理，不会改动已有总述。</div></div>
+      <div class="we-memory-form-grid"><div class="we-input-group"><label>起始时间</label><input class="we-memory-small-time-start" type="text" value="${h(String(item.timeStart ?? ''))}" placeholder="如 2049年10月1日"></div><div class="we-input-group"><label>结束时间</label><input class="we-memory-small-time-end" type="text" value="${h(String(item.timeEnd ?? ''))}" placeholder="可留空"></div></div>
+      <div class="we-input-group"><label>纪要内容</label><textarea class="we-memory-small-content" rows="6">${h(item.content || '')}</textarea><div class="we-hint">API 以 50–200 字为目标，超出时仍完整保留；起止时间为绝对故事时间，可留空。手动新增的纪要只会追加为未整理，不会改动已有总述。</div></div>
       <div class="we-memory-editor-actions"><button class="we-btn we-memory-cancel-edit" type="button">取消</button><button class="we-btn we-btn-primary we-memory-save-small" data-new="${isNew ? 'true' : 'false'}" type="button">保存</button></div>
     </div>`;
     const draft = _memoryEditingSmall === '__new__'
-      ? `<div class="we-memory-record we-memory-record-new" data-small-id="__new__">${editor({ startLayer: eventMemory.small_summary_layer ?? 0, endLayer: eventMemory.small_summary_layer ?? 0, content: '' }, true)}</div>` : '';
+      ? `<div class="we-memory-record we-memory-record-new" data-small-id="__new__">${editor({ startLayer: Math.max(0, Number(eventMemory.small_summary_layer) || 0), endLayer: Math.max(0, Number(eventMemory.small_summary_layer) || 0), content: '' }, true)}</div>` : '';
     const cards = items.map((item, index) => {
       const collapseKey = `small:${item.id}`;
       const defaultCollapsed = index !== items.length - 1;
+      const timeLabel = memoryTimeRangeLabel(item);
       return `<div class="${memoryRecordClass(collapseKey, '', defaultCollapsed)}" data-small-id="${h(item.id)}">
-      <div class="we-memory-record-head" data-memory-collapse-key="${h(collapseKey)}" role="button" tabindex="0"><div><div class="we-memory-record-title">楼层 ${h(String(item.startLayer))}–${h(String(item.endLayer))}</div><div class="we-memory-record-meta">${index < cursor ? '已归入总述' : '等待归档'} · ${h(item.id)}</div></div>
+      <div class="we-memory-record-head" data-memory-collapse-key="${h(collapseKey)}" role="button" tabindex="0"><div><div class="we-memory-record-title">楼层 ${h(String(item.startLayer))}–${h(String(item.endLayer))}${timeLabel ? ' · ' + h(timeLabel) : ''}</div><div class="we-memory-record-meta">${index < cursor ? '已归入总述' : '等待归档'} · ${h(item.id)}</div></div>
         <div class="we-memory-record-actions">${memoryRecordToggle(collapseKey, defaultCollapsed)}<button class="we-icon-btn we-memory-edit-small" type="button" title="修改"><i class="fa-solid fa-pen"></i></button><button class="we-icon-btn we-memory-delete-small" type="button" title="删除"><i class="fa-solid fa-trash"></i></button></div>
       </div>
       ${memoryRecordBody(collapseKey, _memoryEditingSmall === item.id ? editor(item, false) : `<div class="we-memory-summary-text">${h(item.content || '（内容为空）')}</div>`, defaultCollapsed)}
@@ -613,7 +655,8 @@ window.WORLD_ENGINE_UI = (function() {
     const items = Array.isArray(state.event_memory?.big_summaries) ? state.event_memory.big_summaries : [];
     const editor = (big, isNew) => `<div class="we-memory-editor">
       <div class="we-memory-form-grid"><div class="we-input-group"><label>起始楼层</label><input class="we-memory-big-start" type="number" min="0" value="${h(String(big.startLayer ?? 0))}"></div><div class="we-input-group"><label>结束楼层</label><input class="we-memory-big-end" type="number" min="0" value="${h(String(big.endLayer ?? 0))}"></div></div>
-      <div class="we-input-group"><label>总述内容</label><textarea class="we-memory-big-content" rows="10">${h(big.content || '')}</textarea><div class="we-hint">API 目标下限为 500 字，上限为本批纪要正文的一半；上限不足 500 时上下限均为 500 字。超出时仍完整保留；删除总述不会回退纪要整理游标。</div></div>
+      <div class="we-memory-form-grid"><div class="we-input-group"><label>起始时间</label><input class="we-memory-big-time-start" type="text" value="${h(String(big.timeStart ?? ''))}" placeholder="如 2049年10月1日"></div><div class="we-input-group"><label>结束时间</label><input class="we-memory-big-time-end" type="text" value="${h(String(big.timeEnd ?? ''))}" placeholder="可留空"></div></div>
+      <div class="we-input-group"><label>总述内容</label><textarea class="we-memory-big-content" rows="10">${h(big.content || '')}</textarea><div class="we-hint">API 目标下限为 500 字，上限为本批纪要正文的一半；上限不足 500 时上下限均为 500 字。起止时间为绝对故事时间，可留空。超出时仍完整保留；删除总述不会回退纪要整理游标。</div></div>
       <div class="we-memory-editor-actions"><button class="we-btn we-memory-cancel-edit" type="button">取消</button><button class="we-btn we-btn-primary we-memory-save-big" data-new="${isNew ? 'true' : 'false'}" type="button">保存</button></div>
     </div>`;
     const draft = _memoryEditingBig === '__new__'
@@ -621,8 +664,9 @@ window.WORLD_ENGINE_UI = (function() {
     const cards = items.map((big, index) => {
       const collapseKey = `big:${big.id}`;
       const defaultCollapsed = index !== items.length - 1;
+      const timeLabel = memoryTimeRangeLabel(big);
       return `<div class="${memoryRecordClass(collapseKey, 'we-memory-overview-record', defaultCollapsed)}" data-big-id="${h(big.id)}">
-      <div class="we-memory-record-head" data-memory-collapse-key="${h(collapseKey)}" role="button" tabindex="0"><div><div class="we-memory-record-title">总述 ${index + 1}</div><div class="we-memory-record-meta">楼层 ${h(String(big.startLayer))}–${h(String(big.endLayer))} · ${h(big.id)}</div></div>
+      <div class="we-memory-record-head" data-memory-collapse-key="${h(collapseKey)}" role="button" tabindex="0"><div><div class="we-memory-record-title">${Number(big.level) === 2 ? '更早总述' : '总述'} ${index + 1}</div><div class="we-memory-record-meta">楼层 ${h(String(big.startLayer))}–${h(String(big.endLayer))}${timeLabel ? ' · ' + h(timeLabel) : ''} · ${h(big.id)}</div></div>
         <div class="we-memory-record-actions">${memoryRecordToggle(collapseKey, defaultCollapsed)}<button class="we-icon-btn we-memory-edit-big" type="button" title="修改"><i class="fa-solid fa-pen"></i></button><button class="we-icon-btn we-memory-delete-big" type="button" title="删除"><i class="fa-solid fa-trash"></i></button></div>
       </div>
       ${memoryRecordBody(collapseKey, _memoryEditingBig === big.id ? editor(big, false) : `<div class="we-memory-summary-text">${h(big.content || '（内容为空）')}</div>`, defaultCollapsed)}
@@ -642,6 +686,7 @@ window.WORLD_ENGINE_UI = (function() {
     const state = window.MEMORY_ENGINE_DATA?.loadState?.() || {};
     const meta = MEMORY_VIEW_META[view] || { title: view, poem: '' };
     const content = view === 'people' ? renderMemoryPeople(state)
+      : view === 'npcs' ? renderMemoryNpcProfiles(state)
       : view === 'entities' ? renderMemoryEntities(state)
       : view === 'minutes' ? renderMemoryMinutes(state)
       : renderMemoryOverview(state);
@@ -651,6 +696,7 @@ window.WORLD_ENGINE_UI = (function() {
   function clearMemoryEditing() {
     _memoryEditingPerson = null;
     _memoryEditingEntity = null;
+    _memoryEditingNpc = null;
     _memoryEditingSmall = null;
     _memoryEditingBig = null;
   }
@@ -849,6 +895,56 @@ window.WORLD_ENGINE_UI = (function() {
       };
     });
 
+    // 人物状态档案：手动编辑按主名定位，保存走 saveEditedMemoryState 统一落盘。
+    const addNpc = document.getElementById('we-memory-add-npc');
+    if (addNpc) addNpc.onclick = () => { clearMemoryEditing(); _memoryEditingNpc = '__new__'; refresh(); };
+    document.querySelectorAll('.we-memory-edit-npc').forEach(button => {
+      button.onclick = () => {
+        const id = button.closest('[data-npc-id]')?.dataset.npcId || null;
+        if (id) expandMemoryRecord(`npc:${id}`);
+        clearMemoryEditing(); _memoryEditingNpc = id; refresh();
+      };
+    });
+    document.querySelectorAll('.we-memory-delete-npc').forEach(button => {
+      button.onclick = () => {
+        const id = button.closest('[data-npc-id]')?.dataset.npcId;
+        const state = window.MEMORY_ENGINE_DATA?.loadState?.();
+        const profiles = Array.isArray(state?.npc_profiles) ? state.npc_profiles : [];
+        const index = profiles.findIndex(profile => profile.id === id);
+        if (index < 0 || !confirm(`删除「${profiles[index].names?.[0] || id}」的状态档案？该人物的记忆不受影响。`)) return;
+        profiles.splice(index, 1);
+        if (saveEditedMemoryState(state, '人物状态已删除')) { clearMemoryEditing(); refresh(); }
+      };
+    });
+    document.querySelectorAll('.we-memory-save-npc').forEach(button => {
+      button.onclick = () => {
+        const editor = button.closest('[data-npc-editor]');
+        const state = window.MEMORY_ENGINE_DATA?.loadState?.();
+        if (!editor || !state) return;
+        const names = Array.from(new Set(String(editor.querySelector('.we-memory-npc-names')?.value || '')
+          .split(/[\/／,，\n]/).map(value => value.trim()).filter(Boolean)));
+        if (!names.length) { showToast('请至少填写一个人物名称', true); return; }
+        if (!Array.isArray(state.npc_profiles)) state.npc_profiles = [];
+        const id = editor.dataset.npcId;
+        const duplicate = state.npc_profiles.some(profile => profile.id !== id
+          && (profile.names || []).some(name => names.includes(String(name).trim())));
+        if (duplicate) { showToast('该名称已被其他人物状态使用', true); return; }
+        const fields = {
+          location: String(editor.querySelector('.we-memory-npc-location')?.value || '').trim(),
+          condition: String(editor.querySelector('.we-memory-npc-condition')?.value || '').trim(),
+          stance: String(editor.querySelector('.we-memory-npc-stance')?.value || '').trim()
+        };
+        let profile = state.npc_profiles.find(item => item.id === id);
+        if (!profile) {
+          profile = { id: nextMemoryUiId(state.npc_profiles, 'npc'), names: [], location: '', condition: '', stance: '', sourceDigest: '' };
+          state.npc_profiles.push(profile);
+        }
+        profile.names = names;
+        Object.assign(profile, fields);
+        if (saveEditedMemoryState(state, '人物状态已保存')) { clearMemoryEditing(); refresh(); }
+      };
+    });
+
     document.querySelectorAll('.we-memory-add-entry').forEach(button => {
       button.onclick = () => {
         const editor = button.closest('.we-memory-editor');
@@ -890,16 +986,18 @@ window.WORLD_ENGINE_UI = (function() {
         const content = String(card?.querySelector('.we-memory-small-content')?.value || '').trim();
         const startLayer = Math.max(0, parseInt(card?.querySelector('.we-memory-small-start')?.value) || 0);
         const endLayer = Math.max(startLayer, parseInt(card?.querySelector('.we-memory-small-end')?.value) || startLayer);
+        const timeStart = String(card?.querySelector('.we-memory-small-time-start')?.value || '').trim();
+        const timeEnd = String(card?.querySelector('.we-memory-small-time-end')?.value || '').trim();
         if (!content) { showToast('纪要内容不能为空', true); return; }
         const state = window.MEMORY_ENGINE_DATA?.loadState?.(), items = state?.event_memory?.small_summaries || [];
         if (button.dataset.new === 'true') {
-          items.push({ id: nextMemoryUiId(items, 'small'), startLayer, endLayer, content });
+          items.push({ id: nextMemoryUiId(items, 'small'), startLayer, endLayer, content, timeStart, timeEnd });
           if (saveEditedMemoryState(state, '纪要已新增')) { clearMemoryEditing(); refresh(); }
           return;
         }
         const index = items.findIndex(item => item.id === id);
         if (index < 0) return;
-        items[index] = { ...items[index], startLayer, endLayer, content };
+        items[index] = { ...items[index], startLayer, endLayer, content, timeStart, timeEnd };
         if (saveEditedMemoryState(state, '纪要已修改')) { clearMemoryEditing(); refresh(); }
       };
     });
@@ -928,17 +1026,19 @@ window.WORLD_ENGINE_UI = (function() {
         const content = String(card?.querySelector('.we-memory-big-content')?.value || '').trim();
         const startLayer = Math.max(0, parseInt(card?.querySelector('.we-memory-big-start')?.value) || 0);
         const endLayer = Math.max(startLayer, parseInt(card?.querySelector('.we-memory-big-end')?.value) || startLayer);
+        const timeStart = String(card?.querySelector('.we-memory-big-time-start')?.value || '').trim();
+        const timeEnd = String(card?.querySelector('.we-memory-big-time-end')?.value || '').trim();
         if (!content) { showToast('总述内容不能为空', true); return; }
         const state = window.MEMORY_ENGINE_DATA?.loadState?.();
         const items = state?.event_memory?.big_summaries || [];
         if (button.dataset.new === 'true') {
-          items.push({ id: nextMemoryUiId(items, 'big'), startLayer, endLayer, content });
+          items.push({ id: nextMemoryUiId(items, 'big'), startLayer, endLayer, content, timeStart, timeEnd });
           if (saveEditedMemoryState(state, '总述已新增')) { clearMemoryEditing(); refresh(); }
           return;
         }
         const item = state?.event_memory?.big_summaries?.find(big => big.id === id);
         if (!item) return;
-        Object.assign(item, { startLayer, endLayer, content });
+        Object.assign(item, { startLayer, endLayer, content, timeStart, timeEnd });
         if (saveEditedMemoryState(state, '总述已修改')) { clearMemoryEditing(); refresh(); }
       };
     });
@@ -1171,6 +1271,8 @@ window.WORLD_ENGINE_UI = (function() {
     const mode = settings.evolveMode === 'manual' ? 'manual' : 'auto';
     const bigSummaryEveryX = Math.max(1, parseInt(settings.bigSummaryEveryX) || 5);
     const bigSummaryInjectLimit = Math.max(1, parseInt(settings.bigSummaryInjectLimit) || 3);
+    const smallSummaryInjectLimit = Math.max(1, parseInt(settings.smallSummaryInjectLimit) || 10);
+    const metaSummaryEveryX = Math.max(2, parseInt(settings.metaSummaryEveryX) || 6);
     const hideCoveredRawText = settings.hideCoveredRawText !== false;
     const recentRawRounds = Math.max(0, parseInt(settings.recentRawRounds) || 0);
     const referenceRawRounds = Math.max(0, parseInt(settings.referenceRawRounds) || 0);
@@ -1255,6 +1357,11 @@ window.WORLD_ENGINE_UI = (function() {
         <label>总述间隔轮数（X）</label>
         <input type="number" id="we-memory-big-summary-every" min="1" step="1" value="${bigSummaryEveryX}" style="width:100%;">
       </div>
+      <div class="we-input-group">
+        <label>更早总述合并阈值（X）</label>
+        <input type="number" id="we-memory-meta-summary-every" min="2" step="1" value="${metaSummaryEveryX}" style="width:100%;">
+        <div style="font-size:11px;color:var(--we-text3);margin-top:3px;">未合并的总述积压到 X 条时，把保留窗口之外的最旧几条合并成一条更早总述；注入时以「更早总述 + 最近总述」两级呈现，更早的剧情不再随总述滚出注入窗口而丢失。</div>
+      </div>
       <div style="display:flex;gap:6px;flex-wrap:wrap;">
         <button class="we-btn we-btn-primary" id="we-memory-run-now" type="button"><i class="fa-solid fa-brain"></i> 提取本轮记忆</button>
         <button class="we-btn" id="we-memory-big-summary-now" type="button"><i class="fa-solid fa-book-open"></i> 生成总述</button>
@@ -1267,7 +1374,7 @@ window.WORLD_ENGINE_UI = (function() {
           <input type="checkbox" id="we-memory-inject" ${settings.injectIntoPrompt !== false ? 'checked' : ''}>
           注入记忆信息
         </label>
-        <div style="font-size:11px;color:var(--we-text3);margin-top:3px;">注入最新 Y 条总述和尚未整理的纪要；被有效纪要或总述覆盖的旧正文自动隐藏，但“本地机制”中设置的近期轮数始终保留原文；同时扫描最近 N 层正文中的人物及实体名称，按需注入相关人物与实体记忆。</div>
+        <div style="font-size:11px;color:var(--we-text3);margin-top:3px;">按「更早总述 → 最新 Y 条总述 → 最新 Z 条未整理纪要」注入，纪要与总述自带剧情时间时注入行以时间标注替代楼层号；被有效纪要或总述覆盖的旧正文自动隐藏，但“本地机制”中设置的近期轮数始终保留原文；同时扫描最近 N 层正文中的人物及实体名称，按需注入相关人物与实体记忆。</div>
       </div>
       <div class="we-input-group" style="display:flex;gap:6px;">
         <div style="flex:1;">
@@ -1282,7 +1389,12 @@ window.WORLD_ENGINE_UI = (function() {
       <div class="we-input-group">
         <label>最多注入最新总述数（Y）</label>
         <input type="number" id="we-memory-big-summary-inject-limit" min="1" step="1" value="${bigSummaryInjectLimit}" style="width:100%;">
-        <div style="font-size:11px;color:var(--we-text3);margin-top:3px;">只限制总述数量；尚未整理的纪要仍会全部注入。本地与 JSON 中的历史总述不会被删除或截断。</div>
+        <div style="font-size:11px;color:var(--we-text3);margin-top:3px;">同时限制总述与更早总述的注入条数；历史记录本身不会被删除或截断。</div>
+      </div>
+      <div class="we-input-group">
+        <label>最多注入纪要数（Z）</label>
+        <input type="number" id="we-memory-small-summary-inject-limit" min="1" step="1" value="${smallSummaryInjectLimit}" style="width:100%;">
+        <div style="font-size:11px;color:var(--we-text3);margin-top:3px;">尚未整理的纪要只注入最新 Z 条；更早纪要的正文保持可见，不隐藏、不丢失。</div>
       </div>
       <div style="font-size:11px;color:var(--we-text3);">人物和实体历史使用 1d10000 指数权重抽取：越新的记录越容易入选，最旧记录也保留非零机会。</div>`;
 
@@ -1313,13 +1425,6 @@ window.WORLD_ENGINE_UI = (function() {
         <label>推演辅助 · 纪要之前追加总述数</label>
         <input type="number" id="we-memory-reference-big-count" min="0" step="1" value="${referenceBigSummaryCount}" style="width:100%;">
         <div style="font-size:11px;color:var(--we-text3);margin-top:3px;">从所选纪要之前继续向前取不重叠的总述；0 表示不追加总述。参考顺序固定为“总述 → 纪要 → 正文 → 本轮”。</div>
-      </div>
-      <div class="we-input-group" style="border-top:1px solid var(--we-border,#3a3a3a);padding-top:8px;">
-        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
-          <input type="checkbox" id="we-memory-persona-enabled" ${settings.personaEnabled === true ? 'checked' : ''}>
-          读取酒馆用户人设（用户设定）
-        </label>
-        <div style="font-size:11px;color:var(--we-text3);margin-top:3px;">默认关闭。开启后，人物/实体提取前读取你在酒馆「用户设定」里填写的人设描述注入 prompt，便于判断用户作为知情人物（known_by）与其人际网络。只读、不写回酒馆；人设为空、或你在酒馆把人设注入位置设为「不注入」时自动不注入。</div>
       </div>`;
 
     const linkBody = `
@@ -1335,8 +1440,11 @@ window.WORLD_ENGINE_UI = (function() {
         <input type="number" id="we-memory-world-engine-limit" min="1" step="1" value="${worldEngineMemoryLimit}" style="width:100%;">
       </div>`;
 
+    const backfillProgress = window.MEMORY_ENGINE?.getBackfillProgress?.() || {};
+    const personResumeAt = parseInt(backfillProgress.person?.nextLayer);
+    const summaryResumeAt = parseInt(backfillProgress.summary?.nextLayer);
     const backfillBody = `
-      <div style="font-size:11px;color:var(--we-text3);margin-bottom:6px;">两类重填彼此独立：人物/实体重填不会清理纪要与总述；纪要与总述重填不会改写人物与实体。</div>
+      <div style="font-size:11px;color:var(--we-text3);margin-bottom:6px;">两类重填彼此独立：人物/实体重填不会清理纪要与总述；纪要与总述重填不会改写人物与实体。中途出错或停止会保留进度，再次开始自动从断点楼层继续；「从头重填」清掉进度，下次从初始层整库重来。</div>
       <div style="display:flex;gap:6px;flex-wrap:wrap;">
         <div class="we-input-group" style="flex:1;min-width:90px;margin-bottom:0;"><label>人物实体每批楼层</label>
           <input type="number" id="we-memory-backfill-batch" min="1" step="1" value="${backfillBatch}"></div>
@@ -1351,13 +1459,14 @@ window.WORLD_ENGINE_UI = (function() {
         <div class="we-input-group" style="flex:1;min-width:120px;margin-bottom:0;"><label>总述回填：每 Y 条纪要</label>
           <input type="number" id="we-memory-summary-backfill-big-every" min="1" step="1" value="${summaryBackfillBigEveryX}"></div>
       </div>
-      <div class="we-hint" id="we-memory-person-backfill-status" style="margin:6px 0;"></div>
+      <div class="we-hint" id="we-memory-person-backfill-status" style="margin:6px 0;">${Number.isFinite(personResumeAt) && personResumeAt > 0 ? `上次未完成：已填到第 ${personResumeAt} 楼，开始将从这里继续` : ''}</div>
       <div style="display:flex;gap:6px;flex-wrap:wrap;margin:6px 0;">
         <button class="we-btn we-btn-primary" id="we-memory-backfill-start">▶ 重填人物与实体</button>
         <button class="we-btn we-btn-primary" id="we-memory-summary-backfill-start">▶ 重填纪要与总述</button>
         <button class="we-btn" id="we-memory-backfill-stop">■ 停止</button>
+        <button class="we-btn" id="we-memory-backfill-reset" title="清除两类重填的断点进度（不动已入库的成果），下次开始将从初始层整库重来">↺ 从头重填</button>
       </div>
-      <div class="we-hint" id="we-memory-summary-backfill-status" style="margin:6px 0;"></div>`;
+      <div class="we-hint" id="we-memory-summary-backfill-status" style="margin:6px 0;">${Number.isFinite(summaryResumeAt) && summaryResumeAt > 0 ? `上次未完成：已填到第 ${summaryResumeAt} 楼，开始将从这里继续` : ''}</div>`;
 
     const memoryTheme = getStoredMemoryTheme();
     const memoryThemeOptions = WE_THEMES.map(theme =>
@@ -1512,6 +1621,70 @@ window.WORLD_ENGINE_UI = (function() {
     const worldbook = String(extra.worldbook || '')
       .replace(/后台推演世界书/g, '记忆推演世界书')
       .replace(/注入推演/g, '注入记忆推演');
+    // 远事召回（向量检索）状态行
+    const vectorStatus = window.MEMORY_ENGINE_VECTOR?.getVectorStatus?.() || {};
+    const vectorStatusText = vectorStatus.enabled
+      ? `已索引 ${vectorStatus.indexed || 0} / ${vectorStatus.total || 0} 条纪要${vectorStatus.recallCount ? ` · 上次召回 ${vectorStatus.recallCount} 条` : ''}${vectorStatus.lastError ? ` · 最近异常：${vectorStatus.lastError}` : ''}`
+      : '未启用';
+    const vectorBody = `
+      <div class="we-input-group">
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+          <input type="checkbox" id="we-memory-vector-enabled" ${settings.vectorEnabled === true ? 'checked' : ''}>
+          启用远事召回（生成前向量检索久远纪要）
+        </label>
+        <div style="font-size:11px;color:var(--we-text3);margin-top:3px;">生成前把最近对话改写成检索查询，从全部纪要的向量索引中召回窗口外的旧事注入【远事召回】节。仅支持直连端点；每次生成会额外发出 1-3 次请求（查询重写 + 查询向量 + 可选重排），重 roll 命中缓存不重复请求。Embedding 模型留空＝功能不生效。</div>
+      </div>
+      <div class="we-subgroup">
+        <div class="we-subgroup-title"><i class="fa-solid fa-plug"></i>向量连接与模型</div>
+        <div class="we-input-group">
+          <label>向量端点 URL（留空由记忆引擎 API URL 推导 /embeddings）</label>
+          <input type="text" id="we-memory-vector-url" value="${u(settings.vectorApiUrl || '')}" placeholder="https://api.example.com/v1/embeddings">
+        </div>
+        <div class="we-input-group">
+          <label>向量 API Key（留空复用记忆引擎 Key）</label>
+          <input type="password" id="we-memory-vector-key" value="${u(settings.vectorApiKey || '')}">
+        </div>
+        <div class="we-input-group">
+          <label>Embedding 模型（留空＝不启用召回）</label>
+          <input type="text" id="we-memory-vector-model" value="${u(settings.vectorModel || '')}" placeholder="例如 text-embedding-3-small">
+        </div>
+        <div class="we-input-group">
+          <label>查询重写模型（留空复用记忆引擎主模型）</label>
+          <input type="text" id="we-memory-vector-rewrite-model" value="${u(settings.vectorRewriteModel || '')}" placeholder="便宜的小模型即可">
+        </div>
+      </div>
+      <div class="we-subgroup">
+        <div class="we-subgroup-title"><i class="fa-solid fa-magnifying-glass"></i>召回</div>
+        <div style="display:flex;gap:6px;">
+          <div class="we-input-group" style="flex:1;">
+            <label>召回条数上限</label>
+            <input type="number" id="we-memory-vector-count" min="1" step="1" value="${Math.max(1, parseInt(settings.vectorRecallCount) || 6)}">
+          </div>
+          <div class="we-input-group" style="flex:1;">
+            <label>相似度阈值（%）</label>
+            <input type="number" id="we-memory-vector-min-score" min="1" max="95" step="1" value="${Math.max(1, parseInt(settings.vectorMinScore) || 35)}">
+          </div>
+        </div>
+      </div>
+      <div class="we-subgroup">
+        <div class="we-subgroup-title"><i class="fa-solid fa-arrow-down-short-wide"></i>重排（可选）</div>
+        <div class="we-input-group">
+          <label>重排端点 URL（留空由向量端点推导 /rerank）</label>
+          <input type="text" id="we-memory-vector-rerank-url" value="${u(settings.vectorRerankUrl || '')}" placeholder="https://api.example.com/v1/rerank">
+        </div>
+        <div class="we-input-group">
+          <label>重排 API Key（留空逐级复用）</label>
+          <input type="password" id="we-memory-vector-rerank-key" value="${u(settings.vectorRerankKey || '')}">
+        </div>
+        <div class="we-input-group">
+          <label>重排模型（留空＝不重排，按向量相似度排序）</label>
+          <input type="text" id="we-memory-vector-rerank-model" value="${u(settings.vectorRerankModel || '')}" placeholder="例如 jina-reranker-v2-base-multilingual">
+        </div>
+      </div>
+      <div style="display:flex;gap:6px;align-items:center;">
+        <button class="we-btn" id="we-memory-vector-rebuild" type="button"><i class="fa-solid fa-rotate"></i> 重建索引</button>
+        <span class="we-hint" id="we-memory-vector-status" style="flex:1;">${h(vectorStatusText)}</span>
+      </div>`;
     const panelContent = {
       common: sec('set-memory-api', '记忆引擎 API', apiBody)
         + sec('set-memory-evolve', '记忆提取与事件整理', modeBody)
@@ -1519,6 +1692,7 @@ window.WORLD_ENGINE_UI = (function() {
       mechanics: sec('set-memory-mechanics', '正文保留与推演参考', mechanicsBody),
       link: sec('set-memory-link', '向世界引擎联动', linkBody),
       advanced: sec('set-memory-retry', 'API 自动重试', retryBody)
+        + sec('set-memory-vector', '远事召回（向量检索）', vectorBody)
         + sec('set-memory-blacklist', '人物与实体黑名单', blacklistBody)
         + sec('set-memory-backfill', '批量重填记忆推演', backfillBody)
         + sec('set-memory-filter', '输入过滤器', filterBody)
@@ -1675,6 +1849,63 @@ window.WORLD_ENGINE_UI = (function() {
     return !!(active && panelBodyElement && panelBodyElement.contains(active) && active.isContentEditable);
   }
 
+  // ===== 整块重建的滚动/焦点保留 =====
+  // innerHTML 重建后元素全部换新，按「稳定标识」登记再回填：id 优先（跨渲染不变），
+  // 无 id 用 tag+前两个 class 的父链近似。尽力而为，匹配不上就保持默认位置。
+  function uiElementKey(el) {
+    if (el.id) return '#' + el.id;
+    const parts = [];
+    let node = el;
+    while (node && node.classList && parts.length < 4) {
+      parts.unshift(node.tagName.toLowerCase() + (node.classList.length ? '.' + Array.from(node.classList).slice(0, 2).join('.') : ''));
+      node = node.parentElement;
+    }
+    return parts.join('>');
+  }
+  function panelNodes(root) {
+    return [root].concat(Array.from(root.querySelectorAll('*')));
+  }
+  function capturePanelViewport(root) {
+    const cap = { scrolls: [], focus: null };
+    if (!root) return cap;
+    for (const el of panelNodes(root)) {
+      if (el.scrollTop > 0) cap.scrolls.push({ key: uiElementKey(el), top: el.scrollTop });
+    }
+    const active = document.activeElement;
+    if (active && root.contains(active)) {
+      cap.focus = {
+        key: uiElementKey(active),
+        start: typeof active.selectionStart === 'number' ? active.selectionStart : null,
+        end: typeof active.selectionEnd === 'number' ? active.selectionEnd : null
+      };
+    }
+    return cap;
+  }
+  function restorePanelViewport(root, cap) {
+    if (!root || !cap) return;
+    if (cap.scrolls.length) {
+      const tops = new Map(cap.scrolls.map(e => [e.key, e.top]));
+      const used = new Set();
+      for (const el of panelNodes(root)) {
+        const key = uiElementKey(el);
+        if (tops.has(key) && !used.has(key)) { el.scrollTop = tops.get(key); used.add(key); }
+      }
+    }
+    if (cap.focus) {
+      for (const el of panelNodes(root)) {
+        if (uiElementKey(el) === cap.focus.key && typeof el.focus === 'function') {
+          try {
+            el.focus();
+            if (cap.focus.start != null && typeof el.setSelectionRange === 'function') {
+              el.setSelectionRange(cap.focus.start, cap.focus.end != null ? cap.focus.end : cap.focus.start);
+            }
+          } catch (e) { /* 不可聚焦/不可选中的元素忽略 */ }
+          return;
+        }
+      }
+    }
+  }
+
   function refresh(auto) {
     if (!panelElement || !panelVisible) return;
     updateEngineFaceChrome();
@@ -1699,13 +1930,31 @@ window.WORLD_ENGINE_UI = (function() {
     }
     const body = panelBodyElement;
     if (!body) return;
-    listPagerCounter = 0;
 
     const state = core.loadState();
     const checkpoint = core.restoreCheckpoint();
     const cpLayer = getCheckpointLayer(checkpoint);
     const active = getActiveInjected(state, checkpoint);
     const s = active.state;
+
+    // —— 后台空转跳过：数据签名未变就不重建 DOM ——
+    // 消掉 30 秒定时刷新的整块重绘（闪烁、滚动/分页位置丢失、133 个 onclick 全量重绑）。
+    // 签名覆盖世界视图全部数据源：视图、展开模式、注入范围/层、轮次、运行态、指纹与两份状态 JSON。
+    if (auto) {
+      const sig = JSON.stringify([
+        _currentView, isExpandMode(), active.scope, active.layer, s.round,
+        typeof evolution.isRunning === 'function' ? evolution.isRunning() : false,
+        isEvolving, core.loadFingerprint(), state, checkpoint
+      ]);
+      if (sig === _lastRefreshSig) return;
+      _lastRefreshSig = sig;
+    } else {
+      _lastRefreshSig = null;
+    }
+
+    listPagerCounter = 0;
+
+    const viewport = capturePanelViewport(body);
 
     const _wbListEl = document.getElementById('we-worldbook-list');
     if (_wbListEl) _wbScrollTop = _wbListEl.scrollTop;
@@ -1720,6 +1969,7 @@ window.WORLD_ENGINE_UI = (function() {
       body.innerHTML = renderSubView(_currentView, s, active.layer, active.scope);
     }
 
+    restorePanelViewport(body, viewport);
     updatePanelHeader(s, active.layer);
     bindEvents(state);
   }
@@ -1969,6 +2219,9 @@ window.WORLD_ENGINE_UI = (function() {
   //   date    —— 可选，日期不确定的留月份/年份；
   //   items   —— 该版本改动条目（每条一行，渲染时走 h() 转义）。
   const CHANGELOG = [
+    { version: '3.5.0', date: '2026-10-17', items: ['新增「远事召回」（记忆引擎设置 → 高级）：把全部纪要建成向量索引（int8 量化本地存储），生成前把最近对话改写成检索查询、多路检索出窗口外的旧事并可经重排端点复序，超过相似度阈值的前几条注入【远事召回】节——久远剧情不再只剩总述概括。端点从记忆引擎 API 推导、可独立配置，仅直连；Embedding 模型留空＝不启用；重 roll 命中缓存不重复请求；任何一步失败都静默降级不阻断生成。', '新增「人物状态」档案：每轮联合提取顺带记录人物的可观察状态（所在位置、当前处境、对主角的外在态度，全部自由文本、不读心），进时间链可随删楼/改楼对账修复；最近楼层出现名字时注入【人物当前状态】节；记忆面板新增「人物状态」子页可查看与手动编辑。', '总述压缩支持多级：更早总述积压到阈值后自动合并成「最早总述」（深度上限三级），注入按「最早总述 → 更早总述 → 最近总述」分层呈现，世界联动回滚沿全链级联撤销。', '批量重填支持断点续填：人物/实体与纪要/总述两类重填的进度记入记忆状态，每批成功即推进断点，中途出错或手动停止后再次开始自动从断点楼层继续，不再清空成果推倒重来；设置页新增「从头重填」按钮，可清除进度回到从初始层整库重来的旧行为。'] },
+    { version: '3.4.2', date: '2026-10-17', items: ['记忆引擎新增「更早总述」两级归档：未合并总述积压到阈值（默认 6，可调）后自动把保留窗口之外的最旧几条合并成更早总述，注入以「更早总述 + 最近总述」两级呈现，久远剧情不再随总述滚出注入窗口而丢失；对账修复、总述修复与世界联动回滚均支持级联处理，旧档自动兼容。', '纪要与总述记录起止剧情时间（模型输出 + 正文『』标签兜底 + 子条目继承），注入行以时间标注替代楼层号，能解析数字日期时附加「约 N 天前」相对距离前缀（架空纪年解析不了就不标，宁缺毋错）；面板卡片显示时间、编辑器可手动补时间，旧档无时间自动回退楼层号。', '记忆引擎请求容错加固：模型输出解析新增思维链剥离、智能引号归一、对白野引号补转义与超长字段截断四级清洗；提取请求附带既有记忆与实体既有事件清单，避免模型换措辞重复入库。', '自动提取改为从最老缺口轮补齐：某轮提取失败后不会永久漏出记忆链；批量重填某批失败自动降级为逐轮重填，单轮仍失败才中止并报告卡住的楼层；API 自动重试默认值改为 1 次（已保存过设置的保留原值）。', '注入未整理纪要新增条数上限（默认 10 条，可调），更早纪要正文保持可见不隐藏；注入首段增加私密简报说明，要求模型不复述、不向用户提及记忆内容。'] },
+    { version: '3.4.1', date: '2026-10-15', items: ['「读取酒馆用户人设」取消开关、改为默认启用：推演与记忆提取始终读取你在酒馆「用户设定」里填写的人设描述，作为「{{user}} 的角色设定」注入 prompt（推演设置与记忆引擎设置里的两个开关已移除）；人设为空、读取失败或你在酒馆把人设注入位置设为「不注入」时依旧自动不注入。', '修复「从正文自动回填时间」读柏宝书 <bbs_end> 标签时取错时刻（同日）或错天（跨午夜）：配对原为非贪婪取第一个 <bbs_end>，模型思维链里常裸写「要加上完整的时间锚点 <bbs_start> 和 <bbs_end>」这类格式说明，配对会从提及处一路吃到真正的结束标签，再把段内第一个日期（往往是 <bbs_start> 的开始时刻）当成剧情结束时刻；若提及处自带一对无日期的标签，整楼还会被判成「有标签无日期」直接跳过。现改为按 </bbs_end> 闭标签从后往前配对（取最后一个带日期的配对），并对思维链与 HTML 注释先整块剥离——对裸提及、未闭合思维链、末尾无日期标签对均免疫。', '时间标签解析的思维链剥离放宽到 <think> 的任意变体（<think_nya~>、<think_cot> 等自定义标签此前整块留下，其中的旧日期会混进日期候选池）；正文里普通出现的「think」字样不受影响。', '标签日期识别补上点分隔写法（第四纪元7482.8.15），与正文日期解析口径一致。'] },
     { version: '3.4.0', date: '2026-10-14', items: ['新增「读取酒馆用户人设」（推演设置与记忆引擎的「正文保留与推演参考」各一个开关，默认关闭）：开启后，推演/记忆提取前读取你在酒馆「用户设定」里填写的人设描述，作为「{{user}} 的角色设定」注入 prompt——此前引擎自建请求只把 {{user}} 展开成名字，涉及{{user}}地位、权力、人际关系与行为倾向的推演判定没有依据。纯只读、不写回酒馆，人设为空、读取失败或你在酒馆把注入位置设为「不注入」时自动不注入（尊重酒馆原生设置），上限 4000 字防 prompt 膨胀；推演调试卡 prompt 分段新增「⑤a 用户人设」。', '「从正文自动回填时间」识别能力大幅扩展（仍是零配置通用能力，不依赖任何插件）：日期写法新增 中文数字年月日（二〇二五年十月三日、十月三日、初九/二十日）、全角字符（２０４９／１０／３）、点分隔（2049.10.3）、「号」结尾、分隔符混用（2049年10/3），以及只有月日的「10月3日」——年份继承同楼更靠前的最近一个完整日期，继承不到就放弃、绝不猜年份；思维链与 HTML 注释先剥离再解析。正文多日期（回忆、履历、倒叙极常见）不再无脑取最后一个：按「当前时间」语义打分选取——日期前有 现在/今天/如今/此刻 等当下线索的大幅优先，有 那年/三年前/曾经/回忆 等回溯线索或 明天/后天/计划 等未来线索的降权，都没有时取更靠后的；状态行会告知「正文含 N 个日期，已按当前时间语义选取」。回填成功后状态行新增来源标注（柏宝书时间标签/正文日期/正文仅月日）与识别到的时刻（23:30、深夜等）；柏宝书 <bbs_end> 标签仍是第一优先（语义=剧情结束时刻）。'] },
     { version: '3.3.4', date: '2026-10-13', items: ['正则过滤新增「同时走酒馆正则」开关（推演设置与记忆引擎的过滤区各一个，互不影响）：勾选后喂后台前先按酒馆主生成同款方式过一遍你在酒馆「正则」面板里配置的脚本（只跑勾了「Alter Outgoing Prompt」的脚本，与酒馆发给 AI 的处理完全一致；按用户输入/AI 输出区分作用域，支持最小/最大深度限定）；之后再执行本扩展正则，两者可同时开。', '测试按钮支持单独试跑酒馆正则：勾选开关后正则框留空也能测试，状态行会给出酒馆正则前后的字符数；批量回填读取的对话同样先过酒馆正则。'] },
     { version: '3.3.3', date: '2026-10-13', items: ['推演 prompt 分段顺序优化：「历史剧情摘要」从「⑤c 外部数据源」段中拆出，独立拼在「⑦ 近期对话」正前方（调试卡新增「⑥b 历史剧情摘要」分段）——摘要覆盖窗口起点之前的剧情，与近期对话时间连续，中间不再隔大块世界状态 JSON，模型能把两段读成一条完整时间线；「当前状态快照」仍留在 ⑤c 原位（它是现状事实参照，不属于时间线）。'] },
@@ -2966,6 +3219,15 @@ window.WORLD_ENGINE_UI = (function() {
     if (!box) return;
     box.innerHTML = renderDebug();
     bindPromptSegToggle(box.querySelector('.we-prompt-debug'));
+    // 错误历史清空按钮（在 renderErrorLog 输出内，重绑）
+    const clearErrorsBtn = document.getElementById('we-clear-errors');
+    if (clearErrorsBtn) {
+      clearErrorsBtn.onclick = () => {
+        window.WORLD_ENGINE_ERROR_LOG?.clear?.();
+        showToast('已清空错误历史');
+        refreshDebugRender();
+      };
+    }
     // 导出按钮在 renderDebug 输出内，重绑
     const exportPromptBtn = document.getElementById('we-export-prompt');
     if (exportPromptBtn) {
@@ -3391,12 +3653,41 @@ window.WORLD_ENGINE_UI = (function() {
   // [FIX] renderDebug：推演 prompt 全透明分段展示（只读，不改可编辑）。
   // 把推演 API 收到的整块 prompt 按 10 段拆开折叠展示 + AI 返回 JSON 高亮，只看最新一轮。
   // 数据源 evo.getLastDebug().segments（evolution.js 拼装侧镜像，与实际发出 prompt 字节级一致）。
+  // 错误历史卡：守卫捕获的引擎异常（含记忆引擎，复用同一守卫）+ 上次推演失败原因。
+  // 复用推演分段卡的折叠样式与委托绑定（bindPromptSegToggle），无新 CSS。
+  function renderErrorLog() {
+    const log = window.WORLD_ENGINE_ERROR_LOG;
+    const items = (log && log.list ? log.list() : []).slice(-10).reverse();
+    let lastEvolveError = '';
+    try { lastEvolveError = (window.WORLD_ENGINE_EVOLUTION?.getLastError?.() || ''); } catch (e) {}
+    const meta = (items.length ? items.length + ' 条' : '无');
+    let html = '<div class="we-prompt-seg-card" data-we-seg-key="error-log">'
+      + '<div class="we-prompt-seg-head" data-we-seg-toggle>'
+      + '<span class="we-prompt-seg-arrow">▶</span>'
+      + '<span class="we-prompt-seg-label">⚠️ 错误历史（守卫捕获的引擎异常）</span>'
+      + '<span class="we-prompt-seg-meta">' + meta + '</span>'
+      + '</div>'
+      + '<div class="we-prompt-seg-body" style="display:none;">';
+    if (lastEvolveError) {
+      html += '<div class="we-prompt-seg-empty">上次推演失败：' + u(lastEvolveError) + '</div>';
+    }
+    if (!items.length) {
+      if (!lastEvolveError) html += '<div class="we-prompt-seg-empty">暂无错误记录</div>';
+    } else {
+      html += items.map(e => '<pre class="we-prompt-seg-pre">[' + u(e.time) + '] [' + u(e.engine) + ' · ' + u(e.event) + ']\n' + u(e.message) + '</pre>').join('');
+      html += '<button class="we-btn" id="we-clear-errors" style="margin-top:6px;">清空错误历史</button>';
+    }
+    html += '</div></div>';
+    return html;
+  }
+
   function renderDebug() {
     // 注入自检卡独立于推演数据：每次生成都会更新，故即便尚未推演也要先展示它。
     //   整块仍包在 .we-prompt-debug 里，复用 bindPromptSegToggle 的单一委托接管折叠。
     const injectCard = renderInjectInspector();
     const evo = window.WORLD_ENGINE_EVOLUTION;
-    const wrap = (inner) => '<div class="we-prompt-debug">' + injectCard + inner + '</div>';
+    // 错误历史卡放在推演数据之前：尚未推演（早退空态）时也能看到引擎异常与上次失败原因。
+    const wrap = (inner) => '<div class="we-prompt-debug">' + injectCard + renderErrorLog() + inner + '</div>';
     if (!evo || !evo.getLastDebug) return wrap('<div class="we-empty">调试数据不可用</div>');
     const dbg = evo.getLastDebug();
     if (!dbg || !dbg.prompt) return wrap('<div class="we-empty">尚未推演，暂无调试数据</div>');
@@ -3590,6 +3881,11 @@ window.WORLD_ENGINE_UI = (function() {
         </select>
         <div style="font-size:11px;color:var(--we-text3);margin-top:3px;">按轮 = 只取最近的对话窗口喂给推演，长对话省 token；可见层 = 从头到尾全部未隐藏楼层都喂给推演（类似 choice 的全量上下文），长对话会显著增加 token 消耗。隐藏楼层（🚫 屏蔽的消息）两种模式都不参与。</div>
       </div>
+      <div class="we-input-group">
+        <label>输入预算（字符，0 = 不限制）</label>
+        <input type="number" id="we-prompt-budget" min="0" step="1000" value="${tv('promptBudgetChars', 0)}" style="width:100%;">
+        <div style="font-size:11px;color:var(--we-text3);margin-top:3px;">推演 prompt（规则 + 世界书 + 外部数据源 + 状态 + 对话的总和）的近似字数上限。超出时先丢近期对话的最旧行，仍超则等比收缩世界书/桥/摘要等参照段（核心规则与状态永不裁），完成后状态栏会提示「已裁剪」，调试卡分段可见截断标记。填 0 保持不限制。参考：32k 上下文 ≈ 30000，128k ≈ 100000（中文约 1 字 ≈ 1 token）。</div>
+      </div>
       <div class="we-input-group" id="we-evolve-readrounds-group" style="${(mode === 'auto' && contextMode !== 'visible') ? '' : 'display:none;'}">
         <label>每次推演读取最近几轮对话（a）</label>
         <input type="number" id="we-evolve-readrounds" min="1" step="1" value="${readRounds}" style="width:100%;">
@@ -3599,13 +3895,6 @@ window.WORLD_ENGINE_UI = (function() {
         <label>手动推演读取最近几轮对话</label>
         <input type="number" id="we-manual-readrounds" min="1" step="1" value="${manualReadRounds}" style="width:100%;">
         <div style="font-size:11px;color:var(--we-text3);margin-top:3px;">点击「向前推进」或「重新推进」时，从当前层往前取这些轮的「用户输入 + AI 输出」喂给后台推演。默认 1 = 只读最新一轮。</div>
-      </div>
-      <div class="we-input-group" style="border-top:1px solid var(--we-border,#3a3a3a);padding-top:8px;">
-        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
-          <input type="checkbox" id="we-persona-enabled" ${settings.personaEnabled === true ? 'checked' : ''}>
-          读取酒馆用户人设（用户设定）
-        </label>
-        <div style="font-size:11px;color:var(--we-text3);margin-top:3px;">默认关闭。开启后，每次推演前读取你在酒馆「用户设定」里填写的人设描述，作为「{{user}} 的角色设定」注入 prompt（调试卡可见 ⑤a 段），让涉及{{user}}地位、权力、人际关系与行为倾向的推演判定有据可依。只读、不写回酒馆；人设为空、或你在酒馆把人设注入位置设为「不注入」时自动不注入。上限 4000 字。</div>
       </div>
       <div id="we-evolve-time-group" style="${mode === 'time' ? '' : 'display:none;'}">
         <div class="we-input-group" style="border:1px solid var(--we-border);border-radius:6px;padding:8px;background:var(--we-bg);">
@@ -5004,7 +5293,19 @@ window.WORLD_ENGINE_UI = (function() {
           manualReadRounds: 1,
           smallSummaryEveryX: 1,
           bigSummaryEveryX: Math.max(1, parseInt(gv('we-memory-big-summary-every')) || 5),
+          metaSummaryEveryX: Math.max(2, parseInt(gv('we-memory-meta-summary-every')) || 6),
           bigSummaryInjectLimit: Math.max(1, parseInt(gv('we-memory-big-summary-inject-limit')) || 3),
+          smallSummaryInjectLimit: Math.max(1, parseInt(gv('we-memory-small-summary-inject-limit')) || 10),
+          vectorEnabled: document.getElementById('we-memory-vector-enabled')?.checked === true,
+          vectorApiUrl: gv('we-memory-vector-url') || '',
+          vectorApiKey: gv('we-memory-vector-key') || '',
+          vectorModel: gv('we-memory-vector-model') || '',
+          vectorRewriteModel: gv('we-memory-vector-rewrite-model') || '',
+          vectorRerankUrl: gv('we-memory-vector-rerank-url') || '',
+          vectorRerankKey: gv('we-memory-vector-rerank-key') || '',
+          vectorRerankModel: gv('we-memory-vector-rerank-model') || '',
+          vectorRecallCount: Math.max(1, parseInt(gv('we-memory-vector-count')) || 6),
+          vectorMinScore: Math.min(95, Math.max(1, parseInt(gv('we-memory-vector-min-score')) || 35)),
           hideCoveredRawText: document.getElementById('we-memory-hide-covered-raw')?.checked !== false,
           recentRawRounds: Math.max(0, parseInt(gv('we-memory-recent-raw-rounds')) || 0),
           referenceRawRounds: Math.max(0, parseInt(gv('we-memory-reference-raw-rounds')) || 0),
@@ -5023,7 +5324,6 @@ window.WORLD_ENGINE_UI = (function() {
           worldbookEnabled: document.getElementById('we-memory-worldbook-enabled')?.checked === true,
           worldbookTrigger: document.getElementById('we-worldbook-trigger')?.checked === true,
           worldbookEjsRender: document.getElementById('we-worldbook-ejs')?.checked === true,
-          personaEnabled: document.getElementById('we-memory-persona-enabled')?.checked === true,
           syncToChat: document.getElementById('we-memory-sync-to-chat')?.checked === true,
           autoBackup: document.getElementById('we-memory-auto-backup')?.checked === true,
           backfillBatchSize: Math.max(1, parseInt(gv('we-memory-backfill-batch')) || 5),
@@ -5035,6 +5335,25 @@ window.WORLD_ENGINE_UI = (function() {
         window.MEMORY_ENGINE_SETTINGS?.saveSettings(memorySettings);
         window.MEMORY_ENGINE?.applyInjection?.();
         showToast('设置已保存');
+      };
+    }
+
+    // 远事召回：重建索引按钮（不依赖保存，直接读当前设置全量重嵌）。
+    const vectorRebuildBtn = document.getElementById('we-memory-vector-rebuild');
+    if (vectorRebuildBtn) {
+      vectorRebuildBtn.onclick = async () => {
+        if (!window.MEMORY_ENGINE_VECTOR) { showToast('向量模块未加载', true); return; }
+        vectorRebuildBtn.disabled = true;
+        const statusLine = document.getElementById('we-memory-vector-status');
+        if (statusLine) statusLine.textContent = '正在重建索引…';
+        try {
+          const result = await window.MEMORY_ENGINE_VECTOR.rebuildIndex();
+          if (statusLine) statusLine.textContent = `重建完成：已索引 ${result.indexed} / ${result.total} 条纪要`;
+          showToast('向量索引已重建');
+        } catch (error) {
+          if (statusLine) statusLine.textContent = `重建失败：${error?.message || error}`;
+          showToast('向量索引重建失败', true);
+        } finally { vectorRebuildBtn.disabled = false; }
       };
     }
 
@@ -5186,6 +5505,19 @@ window.WORLD_ENGINE_UI = (function() {
         showToast('当前没有运行中的记忆重填任务');
       };
     }
+    const memoryBackfillReset = document.getElementById('we-memory-backfill-reset');
+    if (memoryBackfillReset) {
+      memoryBackfillReset.onclick = () => {
+        if (typeof window.MEMORY_ENGINE?.resetBackfillProgress !== 'function') {
+          showToast('记忆引擎尚未加载', true);
+          return;
+        }
+        try {
+          window.MEMORY_ENGINE.resetBackfillProgress();
+          showToast('重填进度已清除，下次开始将从初始层重填');
+        } catch (error) { showToast(error?.message || String(error), true); }
+      };
+    }
 
     const saveBtn = document.getElementById('we-save-settings');
     if (saveBtn) {
@@ -5221,9 +5553,10 @@ window.WORLD_ENGINE_UI = (function() {
           evolveEveryX: Math.max(1, parseInt(document.getElementById('we-evolve-everyx')?.value) || 1),
           evolveReadRounds: Math.max(1, parseInt(document.getElementById('we-evolve-readrounds')?.value) || 1),
           manualReadRounds: Math.max(1, parseInt(document.getElementById('we-manual-readrounds')?.value) || 1),
-          personaEnabled: document.getElementById('we-persona-enabled')?.checked === true,
           // 上下文读取模式：'rounds'=按轮 | 'visible'=可见层（非法值按轮）
           contextMode: document.getElementById('we-context-mode')?.value === 'visible' ? 'visible' : 'rounds',
+          // 输入预算（字符）：0 = 不限制
+          promptBudgetChars: Math.max(0, parseInt(gv('we-prompt-budget')) || 0),
           evolveFilterRegex: gv('we-filter-regex') || '',
           filterUseStRegex: document.getElementById('we-filter-use-st-regex')?.checked === true,
           displayMode: document.getElementById('we-display-mode')?.value === 'expand' ? 'expand' : 'mask',
@@ -5282,8 +5615,7 @@ window.WORLD_ENGINE_UI = (function() {
           localWindSentimentLinear: Math.max(0, parseFloat(gv('we-local-wind-sentiment-linear')) || 0),
           localWindSentimentQuadratic: Math.max(0, parseFloat(gv('we-local-wind-sentiment-quadratic')) || 0)
         };
-        window.WORLD_ENGINE_STORE.setItem('world_engine_settings', JSON.stringify(ns));
-        if (window.WORLD_ENGINE_API) window.WORLD_ENGINE_API.getSettings(true);
+        if (window.WORLD_ENGINE_API?.patchSettings) window.WORLD_ENGINE_API.patchSettings(ns);
 
         // [FIX] 保存后校验正则过滤：复用 core.validateFilterRegex。非法条目不阻止保存（与现有数值 clamp 范式一致），
         //   但在状态行展示生效/失败+原因，按是否有失败调整下方 toast。
@@ -5612,10 +5944,7 @@ window.WORLD_ENGINE_UI = (function() {
         if (worldbookScope === 'memory') {
           window.MEMORY_ENGINE_SETTINGS?.patchSettings({ worldbookTrigger: triggerBox.checked });
         } else {
-          const wapi = window.WORLD_ENGINE_API;
-          const cur = wapi && wapi.getSettings ? wapi.getSettings(true) : {};
-          window.WORLD_ENGINE_STORE.setItem('world_engine_settings', JSON.stringify({ ...cur, worldbookTrigger: triggerBox.checked }));
-          if (wapi && wapi.getSettings) wapi.getSettings(true);
+          window.WORLD_ENGINE_API?.patchSettings?.({ worldbookTrigger: triggerBox.checked });
         }
         showToast(triggerBox.checked ? '已开启蓝绿灯触发' : '已关闭蓝绿灯触发（恢复全部已选注入）');
         renderWorldbookList(); // 重渲染以显示/隐藏每条的触发覆写下拉
@@ -5626,10 +5955,7 @@ window.WORLD_ENGINE_UI = (function() {
         if (worldbookScope === 'memory') {
           window.MEMORY_ENGINE_SETTINGS?.patchSettings({ worldbookEjsRender: ejsBox.checked });
         } else {
-          const wapi = window.WORLD_ENGINE_API;
-          const cur = wapi && wapi.getSettings ? wapi.getSettings(true) : {};
-          window.WORLD_ENGINE_STORE.setItem('world_engine_settings', JSON.stringify({ ...cur, worldbookEjsRender: ejsBox.checked }));
-          if (wapi && wapi.getSettings) wapi.getSettings(true);
+          window.WORLD_ENGINE_API?.patchSettings?.({ worldbookEjsRender: ejsBox.checked });
         }
         showToast(ejsBox.checked ? '已开启条目 EJS 渲染' : '已关闭条目 EJS 渲染（恢复原文注入）');
       };
@@ -5778,9 +6104,9 @@ window.WORLD_ENGINE_UI = (function() {
             injectMaxChars: Math.max(0, parseInt(document.getElementById('we-inject-max-chars')?.value) || 0),
             injectAllLevels: document.getElementById('we-inject-all-levels')?.checked === true
           };
-          window.WORLD_ENGINE_STORE.setItem('world_engine_settings', JSON.stringify(worldSettings));
-          if (api.getSettings) api.getSettings(true);
-          requestSettings = worldSettings;
+          requestSettings = window.WORLD_ENGINE_API?.patchSettings
+            ? window.WORLD_ENGINE_API.patchSettings(worldSettings)
+            : worldSettings;
         }
         fetchBtn.disabled = true;
         fetchBtn.textContent = '获取中...';
@@ -5892,10 +6218,7 @@ window.WORLD_ENGINE_UI = (function() {
       return (window.WORLD_ENGINE_API?.getSettings(true)?.tonePrompt || '');
     }
     function saveTonePrompt(text) {
-      const wapi = window.WORLD_ENGINE_API;
-      const cur = wapi && wapi.getSettings ? wapi.getSettings(true) : {};
-      window.WORLD_ENGINE_STORE.setItem('world_engine_settings', JSON.stringify({ ...cur, tonePrompt: text }));
-      if (wapi && wapi.getSettings) wapi.getSettings(true);
+      window.WORLD_ENGINE_API?.patchSettings?.({ tonePrompt: text });
     }
     function updateToneStatus() {
       const el = document.getElementById('we-tone-status');
@@ -6015,12 +6338,9 @@ window.WORLD_ENGINE_UI = (function() {
         });
       }
 
-      // 立即生效并持久化单个开关（与 saveTonePrompt 同模式）
+      // 立即生效并持久化单个开关（走 API 的唯一写入路径）
       const persist = (key, val) => {
-        const wapi = window.WORLD_ENGINE_API;
-        const cur = wapi && wapi.getSettings ? wapi.getSettings(true) : {};
-        window.WORLD_ENGINE_STORE.setItem('world_engine_settings', JSON.stringify({ ...cur, [key]: val }));
-        if (wapi && wapi.getSettings) wapi.getSettings(true);
+        window.WORLD_ENGINE_API?.patchSettings?.({ [key]: val });
       };
 
       const syncBox = document.getElementById('we-sync-to-chat');
@@ -6074,10 +6394,7 @@ window.WORLD_ENGINE_UI = (function() {
       if (!startBtn) return; // 不在设置页
 
       const persistBf = (key, val) => {
-        const wapi = window.WORLD_ENGINE_API;
-        const cur = wapi && wapi.getSettings ? wapi.getSettings(true) : {};
-        window.WORLD_ENGINE_STORE.setItem('world_engine_settings', JSON.stringify({ ...cur, [key]: val }));
-        if (wapi && wapi.getSettings) wapi.getSettings(true);
+        window.WORLD_ENGINE_API?.patchSettings?.({ [key]: val });
       };
       const batchEl = document.getElementById('we-backfill-batch');
       const endEl = document.getElementById('we-backfill-end');
@@ -6527,407 +6844,18 @@ window.WORLD_ENGINE_UI = (function() {
     }
   }
 
-  // ========== 世界引擎悬浮球 ==========
-  let inputButtonObserver = null;
-  let inputButtonRetryTimer = null;
-  const WE_BALL_POS_KEY = 'we-ball-pos';
-  let _ballStatusTimer = null;
+  // ========== 悬浮球聚簇（已拆至 world-engine-ui-ball.js）==========
+  // 原调用点全部保留：转发到球模块；依赖在下方 init() 注入，注入前的调用都发生在运行期。
+  function syncBallFace() { return window.WORLD_ENGINE_UI_BALL?.syncBallFace(); }
+  function updateBallControls() { return window.WORLD_ENGINE_UI_BALL?.updateBallControls(); }
+  function buildInputButton() { return window.WORLD_ENGINE_UI_BALL?.buildInputButton(); }
 
-  function getFaceSettings() {
-    const face = getEngineFace();
-    return callEngineFace(face, 'getSettings', {}) || {};
-  }
-
-  function updateBallControls() {
-    const ball = document.getElementById('we-input-btn');
-    if (!ball) return;
-    const face = getEngineFace();
-    const active = Boolean(callEngineFace(face, 'isRunning', false));
-    const runningLabel = String(callEngineFace(face, 'getRunningLabel', '') || '');
-    const fwd = ball.querySelector('#we-sat-forward');
-    const redo = ball.querySelector('#we-sat-redo');
-    const abort = ball.querySelector('#we-sat-abort');
-    const power = ball.querySelector('#we-sat-power');
-    const engineSwitch = ball.querySelector('#we-sat-engine-switch');
-    if (fwd) {
-      fwd.style.display = face.showForward === true ? '' : 'none';
-      fwd.classList.toggle('we-sat-off', active);
-      fwd.title = face.forwardTitle || `向前推进${face.label}`;
-    }
-    if (redo) {
-      redo.classList.toggle('we-sat-off', active);
-      redo.title = `重新推演${face.label}`;
-    }
-    if (abort) {
-      abort.classList.toggle('we-sat-off', !active);
-      abort.title = active && runningLabel ? `停止${runningLabel}` : `停止${face.label}推演`;
-    }
-    if (power) {
-      power.classList.toggle('on', getFaceSettings().engineEnabled === false);
-      power.style.display = typeof face.setEnabled === 'function' ? '' : 'none';
-      power.title = `开关${face.label}推演与注入`;
-    }
-    if (engineSwitch) {
-      const targetId = face.id === 'memory' ? 'world' : 'memory';
-      const target = getEngineFace(targetId);
-      const targetActive = Boolean(callEngineFace(target, 'isRunning', false));
-      const targetRunningLabel = String(callEngineFace(target, 'getRunningLabel', '') || '');
-      engineSwitch.dataset.targetEngine = target.id;
-      engineSwitch.dataset.engineRunning = targetActive ? 'true' : 'false';
-      engineSwitch.classList.toggle('we-sat-target-world', target.id === 'world');
-      engineSwitch.classList.toggle('we-sat-target-memory', target.id === 'memory');
-      engineSwitch.classList.toggle('we-sat-engine-running', targetActive);
-      engineSwitch.title = targetActive
-        ? `${target.label}正在${targetRunningLabel || '推演'} · 点击切换查看`
-        : `切换到${target.label}`;
-      engineSwitch.setAttribute('aria-label', engineSwitch.title);
-    }
-    ball.classList.toggle('we-ball-evolving', active);
-    ball.title = active && runningLabel
-      ? `${face.label}：正在进行${runningLabel}`
-      : `${face.label}：单击打开面板`;
-    ball.setAttribute('aria-label', ball.title);
-    if (active) ball.classList.remove('we-ball-success', 'we-ball-fail');
-  }
-
-  function syncBallFace() {
-    const ball = document.getElementById('we-input-btn');
-    if (!ball) return;
-    const face = getEngineFace();
-    for (const registered of _engineFaceRegistry.values()) {
-      if (registered.ballClass) ball.classList.remove(registered.ballClass);
-    }
-    if (face.ballClass) ball.classList.add(face.ballClass);
-    ball.dataset.engineFace = face.id;
-    ball.title = `${face.label}：单击打开面板`;
-    ball.setAttribute('aria-label', ball.title);
-    updateBallControls();
-  }
-
-  function loadBallPos() {
-    try {
-      const raw = localStorage.getItem(WE_BALL_POS_KEY);
-      if (raw) {
-        const p = JSON.parse(raw);
-        if (typeof p.left === 'number' && typeof p.top === 'number') return p;
-      }
-    } catch (_) {}
-    return null;
-  }
-
-  function saveBallPos(left, top, tucked, side) {
-    try { localStorage.setItem(WE_BALL_POS_KEY, JSON.stringify({ left, top, tucked: !!tucked, side: side || null })); } catch (_) {}
-  }
-
-  // 侧边吸附参数
-  const WE_TUCK_EDGE = 28;    // 距边缘多近算「吸附」
-  const WE_TUCK_HANDLE = 15;  // 缩进后露出的小条宽度
-  const WE_TUCK_INSET = 8;    // 拉出后距边缘的留白
-
-  function applyBallTuck(ball, side) {
-    const vw = window.innerWidth;
-    const size = ball.offsetWidth || 52;
-    ball.classList.add('we-ball-tucked');
-    ball.classList.toggle('we-ball-tucked-left', side === 'left');
-    ball.classList.toggle('we-ball-tucked-right', side === 'right');
-    ball.style.left = (side === 'left' ? (WE_TUCK_HANDLE - size) : (vw - WE_TUCK_HANDLE)) + 'px';
-  }
-
-  function untuckBall(ball) {
-    const pos = loadBallPos() || {};
-    const vw = window.innerWidth, vh = window.innerHeight, size = ball.offsetWidth || 52;
-    let left = typeof pos.left === 'number' ? pos.left : (vw - size - 18);
-    let top = typeof pos.top === 'number' ? pos.top : (vh - size - 90);
-    left = Math.max(4, Math.min(left, vw - size - 4));
-    top = Math.max(4, Math.min(top, vh - size - 4));
-    ball.classList.remove('we-ball-tucked', 'we-ball-tucked-left', 'we-ball-tucked-right');
-    ball.style.left = left + 'px';
-    ball.style.top = top + 'px';
-    saveBallPos(left, top, false, null);
-  }
-
-  function applyBallPos(ball) {
-    const vw = window.innerWidth, vh = window.innerHeight;
-    const size = ball.offsetWidth || 52;
-    let pos = loadBallPos();
-    if (!pos) pos = { left: vw - size - 44, top: vh - size - 90 };
-    // 钳制进可视区域，避免拖出屏幕后找不到
-    pos.left = Math.max(4, Math.min(pos.left, vw - size - 4));
-    pos.top = Math.max(4, Math.min(pos.top, vh - size - 4));
-    ball.style.top = pos.top + 'px';
-    ball.style.right = 'auto';
-    ball.style.bottom = 'auto';
-    if (pos.tucked && (pos.side === 'left' || pos.side === 'right')) {
-      ball.style.left = pos.left + 'px';   // 记录的是「拉出后」的位置
-      applyBallTuck(ball, pos.side);        // 视觉上缩到边缘
-    } else {
-      ball.classList.remove('we-ball-tucked', 'we-ball-tucked-left', 'we-ball-tucked-right');
-      ball.style.left = pos.left + 'px';
-    }
-  }
-
-  function makeBallDraggable(ball) {
-    let dragging = false, moved = false, sx = 0, sy = 0, ox = 0, oy = 0;
-    const onDown = (e) => {
-      const pt = e.touches ? e.touches[0] : e;
-      dragging = true; moved = false;
-      sx = pt.clientX; sy = pt.clientY;
-      const rect = ball.getBoundingClientRect();
-      ox = rect.left; oy = rect.top;
-      ball.classList.add('we-ball-dragging');
-      document.addEventListener('mousemove', onMove);
-      document.addEventListener('mouseup', onUp);
-      document.addEventListener('touchmove', onMove, { passive: false });
-      document.addEventListener('touchend', onUp);
-    };
-    const onMove = (e) => {
-      if (!dragging) return;
-      const pt = e.touches ? e.touches[0] : e;
-      const dx = pt.clientX - sx, dy = pt.clientY - sy;
-      if (Math.abs(dx) > 4 || Math.abs(dy) > 4) moved = true;
-      if (e.cancelable) e.preventDefault();
-      const size = ball.offsetWidth || 52;
-      let left = Math.max(4, Math.min(ox + dx, window.innerWidth - size - 4));
-      let top = Math.max(4, Math.min(oy + dy, window.innerHeight - size - 4));
-      ball.style.left = left + 'px';
-      ball.style.top = top + 'px';
-    };
-    const onUp = () => {
-      if (!dragging) return;
-      dragging = false;
-      ball.classList.remove('we-ball-dragging');
-      document.removeEventListener('mousemove', onMove);
-      document.removeEventListener('mouseup', onUp);
-      document.removeEventListener('touchmove', onMove);
-      document.removeEventListener('touchend', onUp);
-      if (!moved) return;
-      const vw = window.innerWidth, size = ball.offsetWidth || 52;
-      const left = parseFloat(ball.style.left) || 0;
-      const top = parseFloat(ball.style.top) || 0;
-      if (left <= WE_TUCK_EDGE) {                          // 贴左缘 → 缩进左侧
-        saveBallPos(WE_TUCK_INSET, top, true, 'left');
-        applyBallTuck(ball, 'left');
-      } else if (left >= vw - size - WE_TUCK_EDGE) {        // 贴右缘 → 缩进右侧
-        saveBallPos(vw - size - WE_TUCK_INSET, top, true, 'right');
-        applyBallTuck(ball, 'right');
-      } else {
-        saveBallPos(left, top, false, null);
-      }
-    };
-    ball.addEventListener('mousedown', onDown);
-    ball.addEventListener('touchstart', onDown, { passive: true });
-    // 点击处理：拖动后不算点击；已缩进则「拉出来」而非开面板
-    ball.addEventListener('click', (e) => {
-      if (moved) { e.preventDefault(); e.stopImmediatePropagation(); moved = false; return; }
-      if (ball.classList.contains('we-ball-tucked')) {
-        e.preventDefault(); e.stopImmediatePropagation();
-        untuckBall(ball);
-      }
-    }, true);
-  }
-
-  function observeInputButton() {
-    if (inputButtonObserver || !document.body) return;
-    inputButtonObserver = new MutationObserver(() => {
-      if (!document.getElementById('we-input-btn')) {
-        clearTimeout(inputButtonRetryTimer);
-        inputButtonRetryTimer = setTimeout(buildInputButton, 50);
-      }
-    });
-    inputButtonObserver.observe(document.body, { childList: true, subtree: true });
-  }
-
-  // 解析推演状态文本 → 切换地球形态 + 进度环
-  function setBallState(text, isError) {
-    const ball = document.getElementById('we-input-btn');
-    if (!ball) return;
-    const ring = ball.querySelector('.we-ball-ring');
-    const badge = ball.querySelector('.we-ball-badge');
-    // 悬浮球不显示状态文字（文字走屏幕顶部横幅）
-
-    ball.classList.remove('we-ball-evolving', 'we-ball-success', 'we-ball-fail');
-    clearTimeout(_ballStatusTimer);
-
-    const count = ball.querySelector('.we-ball-count');
-    const clearCount = () => {
-      ball.classList.remove('we-ball-counting');
-      if (count) count.textContent = '';
-      if (ring) ring.style.setProperty('--we-ring-pct', '0deg');
-    };
-
-    if (/回填中/.test(text)) {
-      // 批量回填：地球持续旋转 + 右下角显示「批/总」进度
-      ball.classList.add('we-ball-evolving');
-      if (badge) badge.textContent = '';
-      const mb = /(\d+)\s*\/\s*(\d+)/.exec(text);
-      if (mb && ring) {
-        const cur = Number(mb[1]), total = Number(mb[2]) || 1;
-        const pct = Math.max(0, Math.min(1, cur / total));
-        ring.style.setProperty('--we-ring-pct', (pct * 360) + 'deg');
-        ball.classList.add('we-ball-counting');
-        if (count) count.textContent = `${cur}/${total}`;
-      } else {
-        clearCount();
-      }
-    } else if (/推演中/.test(text)) {
-      ball.classList.add('we-ball-evolving');
-      if (badge) badge.textContent = '';
-      clearCount(); // 推演进行中不展示轮次计数，避免残留旧的 N/X
-    } else if (isError || /失败|异常/.test(text)) {
-      ball.classList.add('we-ball-fail');
-      if (badge) badge.textContent = '✕';
-      _ballStatusTimer = setTimeout(() => clearBallBadge(), 6000);
-    } else if (/完成/.test(text)) {
-      ball.classList.add('we-ball-success');
-      if (badge) badge.textContent = '✓';
-      clearCount(); // 推演完成 → 计数已归零，清掉进度环与数字
-      _ballStatusTimer = setTimeout(() => clearBallBadge(), 4000);
-    }
-
-    // 解析「第 N/X 轮」→ 进度环 + 数字（仅未到推演的提示态才显示）
-    const m = /第\s*(\d+)\s*\/\s*(\d+)\s*轮/.exec(text || '');
-    if (ring && m) {
-      const cur = Number(m[1]), total = Number(m[2]) || 1;
-      const pct = Math.max(0, Math.min(1, cur / total));
-      ring.style.setProperty('--we-ring-pct', (pct * 360) + 'deg');
-      ball.classList.toggle('we-ball-counting', cur > 0 && cur < total);
-      if (count) count.textContent = (cur < total) ? `${cur}/${total}` : '';
-    }
-  }
-
-  function clearBallBadge() {
-    const ball = document.getElementById('we-input-btn');
-    if (!ball) return;
-    ball.classList.remove('we-ball-success', 'we-ball-fail');
-    const badge = ball.querySelector('.we-ball-badge');
-    if (badge) badge.textContent = '';
-  }
-
-  // 屏幕正上方状态横幅：显示约 5s 后淡出
-  let _topStatusTimer = null;
-  function showTopStatus(text, isError) {
-    if (!document.body || !text) return;
-    let el = document.getElementById('we-top-status');
-    if (!el) {
-      el = document.createElement('div');
-      el.id = 'we-top-status';
-      document.body.appendChild(el);
-    }
-    el.textContent = text;
-    el.classList.toggle('we-top-status-error', !!isError);
-    el.classList.add('show');
-    clearTimeout(_topStatusTimer);
-    _topStatusTimer = setTimeout(() => { el.classList.remove('show'); }, 5000);
-  }
-
-  // 给悬浮球的五颗卫星按钮绑事件；阻止冒泡，避免触发拖拽 / 打开面板
-  function wireSatellites(ball) {
-    const wire = (id, fn) => {
-      const el = ball.querySelector('#' + id);
-      if (!el) return;
-      const stop = e => e.stopPropagation();
-      el.addEventListener('mousedown', stop);
-      el.addEventListener('touchstart', stop, { passive: true });
-      el.addEventListener('click', (e) => {
-        e.stopPropagation(); e.preventDefault();
-        if (el.classList.contains('we-sat-off')) return;
-        fn();
-      });
-    };
-    wire('we-sat-forward', () => {
-      callEngineFaceAction(getEngineFace(), 'forward');
-    });
-    wire('we-sat-redo', () => {
-      callEngineFaceAction(getEngineFace(), 'redo');
-    });
-    wire('we-sat-abort', () => {
-      const face = getEngineFace();
-      const done = result => { if (result !== ENGINE_ACTION_FAILED) showToast('已发送停止信号'); };
-      const result = callEngineFaceAction(face, 'abort');
-      if (result && typeof result.then === 'function') result.then(done);
-      else done(result);
-    });
-
-    // 「插头」跟随当前球面：世界面改 world_engine_settings，记忆面改 memory_engine_settings。
-    // 每个已注册引擎各自管理总开关，且不改写用户选好的推演模式与注入选项。
-    //   不用 we-sat-off(wire 内会拦 we-sat-off 不可点);用 .on class 标关闭态,power 永远可点。
-    wire('we-sat-power', () => {
-      const face = getEngineFace();
-      const turnOff = getFaceSettings().engineEnabled !== false;
-      const finish = result => {
-        if (result === ENGINE_ACTION_FAILED) return;
-        updateBallControls();
-        showToast(turnOff ? `已关闭${face.label}推演与注入` : `已开启${face.label}推演与注入`);
-        if (typeof _currentView !== 'undefined' && _currentView === 'settings') refresh();
-      };
-      const result = callEngineFaceAction(face, 'setEnabled', !turnOff);
-      if (result && typeof result.then === 'function') result.then(finish);
-      else finish(result);
-    });
-    wire('we-sat-engine-switch', () => {
-      const shortcut = ball.querySelector('#we-sat-engine-switch');
-      switchEngineFace(shortcut?.dataset.targetEngine || (getEngineFace().id === 'memory' ? 'world' : 'memory'));
-    });
-  }
-
-  function buildInputButton() {
-    if (!document.body) return;
-
-    let btn = document.getElementById('we-input-btn');
-    if (!btn) {
-      btn = document.createElement('button');
-      btn.id = 'we-input-btn';
-      btn.type = 'button';
-      btn.title = '世界引擎';
-      btn.setAttribute('aria-label', '世界引擎');
-      btn.className = 'we-ball';
-      btn.innerHTML =
-        '<span class="we-ball-orbit"></span>' +
-        '<span class="we-ball-ring"></span>' +
-        '<span class="we-ball-core"><span class="we-ball-globe"></span><span class="we-ball-memory"><span class="we-memory-scan"></span></span></span>' +
-        '<span class="we-ball-count"></span>' +
-        '<span class="we-ball-badge"></span>' +
-        '<span class="we-ball-tip"></span>' +
-        '<span class="we-sat we-sat-up" id="we-sat-forward" role="button" title="向前推进"><i class="fa-solid fa-forward"></i></span>' +
-        '<span class="we-sat we-sat-right we-sat-off" id="we-sat-abort" role="button" title="停止推演"><i class="fa-solid fa-stop"></i></span>' +
-        '<span class="we-sat we-sat-down" id="we-sat-redo" role="button" title="重新推进"><i class="fa-solid fa-rotate-right"></i></span>' +
-        '<span class="we-sat we-sat-left" id="we-sat-power" role="button" title="插上=关闭推演与注入 / 拔下=开启"><i class="fa-solid fa-power-off"></i></span>' +
-        '<span class="we-sat we-sat-lower-right we-sat-engine-switch" id="we-sat-engine-switch" role="button"></span>';
-      btn.onclick = () => togglePanel();
-      document.body.appendChild(btn);
-      wireSatellites(btn);
-      syncBallFace();
-      applyBallPos(btn);
-      makeBallDraggable(btn);
-      window.addEventListener('resize', () => applyBallPos(btn));
-      setEvolvingUI(isEvolving || Boolean(evolution?.isRunning?.()));
-    } else if (btn.parentElement !== document.body) {
-      document.body.appendChild(btn);
-      applyBallPos(btn);
-    }
-
-    // 兼容旧的外部状态接口：保留隐藏元素，转发到地球状态机
-    let statusIndicator = document.getElementById('we-external-status');
-    if (!statusIndicator) {
-      statusIndicator = document.createElement('span');
-      statusIndicator.id = 'we-external-status';
-      statusIndicator.style.display = 'none';
-      document.body.appendChild(statusIndicator);
-    }
-
-    window.__WE_SetExternalStatus = function(text, isError) {
-      const el = document.getElementById('we-external-status');
-      if (el) el.textContent = text;
-      setBallState(text || '', !!isError);
-      // 进度类（第 N/X 轮/天、回填中 i/M）只在悬浮球上显示；其余状态走屏幕顶部横幅
-      if (text && !/第\s*\d+\s*\/\s*\d+\s*[轮天]/.test(text) && !/回填中/.test(text)) {
-        showTopStatus(text, !!isError);
-      }
-    };
-
-    buildPanel();
-    observeInputButton();
-  }
+  window.WORLD_ENGINE_UI_BALL?.init({
+    getEngineFace, callEngineFace, callEngineFaceAction, switchEngineFace,
+    togglePanel, setEvolvingUI, buildPanel, refresh, showToast,
+    engineFaceRegistry: _engineFaceRegistry, engineActionFailed: ENGINE_ACTION_FAILED,
+    isEvolving: () => isEvolving, currentView: () => _currentView
+  });
 
   return {
     buildPanel, buildInputButton, showPanel, hidePanel, togglePanel, refresh, setStatus,

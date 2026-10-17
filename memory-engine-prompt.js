@@ -37,6 +37,14 @@ window.MEMORY_ENGINE_PROMPT = (function() {
 9. 同一实体有多条彼此独立的重要事件时，可以返回多项；这些项必须使用相同的 description 更新值（可以同为空字符串），每项只携带一条 event。每个实体本批最多 3 项，全部实体更新合计最多 8 项。
 10. 全部非空 description 和非空 event 必须由待提取对话直接支持。不得为了保留旧描述而把“已知实体”中的 description 原样带回；没有新的描述依据时应返回空字符串。世界书仅用于辨认实体，不得直接生成更新。
 11. 没有值得记录的实体更新时返回空数组 []。
+12. 已知实体条目下缩进列出的既有事件仅用于避免重复；不得把既有事件换一种措辞写成新的 event，只有本批对话中新发生的事件才允许输出。
+
+【人物状态规则】
+1. npc_updates 记录本批对话中「可直接观察到」的人物当前状态，每项只允许 names、location、condition、stance 四个字段。
+2. location 是该人物此刻所在的位置（一句话）；condition 是当前处境或正在做什么（一句话）；stance 是其对主角表现出的外在态度（一句话）。三者独立判断，本批没有可靠观察的字段必须留空字符串，留空表示不更新本地记录。
+3. 禁止把人物的主观记忆、想法或情感判断写入 npc_updates——内心认知属于 personal_memory；stance 只写可观察的外在态度（语气、举动、距离），不得读心。
+4. names 必须是字符串数组，只填正文明确指向同一人物的姓名、称号或别名；优先沿用已知人物名称。
+5. 每个人物本批最多 1 项，整批最多 6 项；没有值得更新的人物状态时返回空数组 []。
 
 【输出前静默筛选】
 在内部完成以下步骤，不要展示过程：人物记忆先按“人物 + 时间 + 主题”聚类，删除流水账、客观说明、从属细节和重复表述，再压缩成不超过 50 个字符的核心记忆；实体先按“type + name”聚类，确定对话结束时的当前描述，再筛出本批新增的重要事件；最后检查分类边界、原文依据、重复项和数量上限。
@@ -64,11 +72,19 @@ window.MEMORY_ENGINE_PROMPT = (function() {
       "event": "0至50个字符的本批新增重要实体事件",
       "time": "event对应的绝对故事时间或空字符串"
     }
+  ],
+  "npc_updates": [
+    {
+      "names": ["人物名或别名"],
+      "location": "所在位置或空字符串",
+      "condition": "当前处境或空字符串",
+      "stance": "对主角的外在态度或空字符串"
+    }
   ]
 }
 
 约束：
-1. 顶层对象只能包含 personal_memory 和 entity_updates。
+1. 顶层对象只能包含 personal_memory、entity_updates 和 npc_updates。
 2. 没有对应内容时，数组返回 []。
 3. PersonalMemory 只能包含 name、known_by、memory、time。
 4. EntityUpdate 只能包含 type、name、aliases、description、event、time。
@@ -79,6 +95,7 @@ window.MEMORY_ENGINE_PROMPT = (function() {
 9. PersonalMemory.time 表示记忆所指事件的绝对故事时间；EntityUpdate.time 只对应 event。无法确定时填写空字符串，event 为空时 time 必须为空。
 10. type 只能是 organization、object、ability、location。
 11. 只输出有效 JSON；模板中的说明文字不得原样输出，不得增加其他字段。
+12. 用户消息中的既有记忆清单仅用于辨认人物、指代与避免重复；不得把其中任何内容换一种措辞重新提取为新增记忆，只有本批对话中新形成的内容才允许输出。
 
 不得增加其他顶层字段或条目字段。`;
 
@@ -105,6 +122,15 @@ window.MEMORY_ENGINE_PROMPT = (function() {
     "event": "一条独立的本批新增重要事件或空字符串",
     "time": "这条事件对应的绝对故事时间或空字符串"
   }
+],
+
+"npc_updates": [
+  {
+    "names": ["人物名或别名"],
+    "location": "所在位置或空字符串",
+    "condition": "当前处境或空字符串",
+    "stance": "对主角的外在态度或空字符串"
+  }
 ]
 }
 
@@ -112,7 +138,7 @@ window.MEMORY_ENGINE_PROMPT = (function() {
 每个 entity_updates 数组项同理只携带一条 event，并单独填写该 event 的 time。
 
 约束：
-1. 本任务负责 personal_memory 和 entity_updates；统一顶层对象除这两个字段外，只能包含同一次请求明确要求的 small_summary 或 big_summary。
+1. 本任务负责 personal_memory、entity_updates 和 npc_updates；统一顶层对象除这三个字段外，只能包含同一次请求明确要求的 small_summary 或 big_summary。
 2. 没有对应内容时，数组返回 []。
 3. PersonalMemory 只能包含 name、known_by、memory、time。
 4. EntityUpdate 只能包含 type、name、aliases、description、event、time。
@@ -132,6 +158,7 @@ window.MEMORY_ENGINE_PROMPT = (function() {
 
   function buildUserPrompt(options) {
     const input = options || {};
+    let entityHistoryBudget = 30;
     const currentStoryTime = clean(input.currentStoryTime);
     const knownPeople = Array.isArray(input.knownPeople)
       ? input.knownPeople.filter(Boolean).map(item =>
@@ -143,7 +170,38 @@ window.MEMORY_ENGINE_PROMPT = (function() {
           if (!item || typeof item !== 'object') return '';
           const type = clean(item.type), name = clean(item.name), description = clean(item.description);
           const aliases = (Array.isArray(item.aliases) ? item.aliases : [item.aliases]).map(clean).filter(Boolean);
-          return name ? `- [${type}] ${name}${aliases.length ? ` / ${aliases.join(' / ')}` : ''}${description ? `：${description}` : ''}` : '';
+          // 既有事件行共享一个总量预算，防止长对话把实体账目撑爆 prompt。
+          const historyLines = [];
+          for (const entry of (Array.isArray(item.history) ? item.history : [])) {
+            if (entityHistoryBudget <= 0) break;
+            const time = clean(entry?.time), event = clean(entry?.event);
+            if (!event) continue;
+            historyLines.push(`  - [${time || '时间未明'}] ${event}`);
+            entityHistoryBudget--;
+          }
+          return name ? `- [${type}] ${name}${aliases.length ? ` / ${aliases.join(' / ')}` : ''}${description ? `：${description}` : ''}${historyLines.length ? `\n${historyLines.join('\n')}` : ''}` : '';
+        }).filter(Boolean)
+      : [];
+    const knownNpcProfiles = Array.isArray(input.knownNpcProfiles)
+      ? input.knownNpcProfiles.map(profile => {
+          if (!profile || typeof profile !== 'object') return '';
+          const names = (Array.isArray(profile.names) ? profile.names : []).map(clean).filter(Boolean);
+          if (!names.length) return '';
+          const parts = [
+            clean(profile.location) ? `位置：${clean(profile.location)}` : '',
+            clean(profile.condition) ? `处境：${clean(profile.condition)}` : '',
+            clean(profile.stance) ? `态度：${clean(profile.stance)}` : ''
+          ].filter(Boolean);
+          return `- ${names.join(' / ')}${parts.length ? `：${parts.join('；')}` : '：暂无状态记录'}`;
+        }).filter(Boolean)
+      : [];
+    const existingMemories = Array.isArray(input.existingMemories)
+      ? input.existingMemories.map(item => {
+          if (!item || typeof item !== 'object') return '';
+          const label = clean(item.label);
+          const records = (Array.isArray(item.records) ? item.records : []).map(clean).filter(Boolean).slice(0, 8);
+          if (!label || !records.length) return '';
+          return `- ${label}：\n${records.map(record => `  - ${record}`).join('\n')}`;
         }).filter(Boolean)
       : [];
     const worldbook = clean(input.worldbook);
@@ -155,6 +213,14 @@ window.MEMORY_ENGINE_PROMPT = (function() {
       `【已知人物名称与别名】\n${knownPeople.length ? knownPeople.map(item => `- ${item}`).join('\n') : '未提供；仅使用对话中明确出现的称呼'}`,
       `【已知实体】\n${knownEntities.length ? knownEntities.join('\n') : '未提供；仅提取对话中明确命名且符合分类定义的实体'}`
     ];
+
+    if (knownNpcProfiles.length) {
+      sections.push(`【已知人物状态】\n${knownNpcProfiles.join('\n')}\n\n以上是既有的人物状态记录，供辨认与增量更新；只有本批对话明确观察到变化时才更新对应字段，未观察到的字段留空。`);
+    }
+
+    if (existingMemories.length) {
+      sections.push(`【既有记忆·对照用，禁止重复提取】\n以下内容此前已经记录在案，仅用于辨认人物、指代与避免重复；不得把其中任何内容换一种措辞重新提取为新增记忆：\n${existingMemories.join('\n')}`);
+    }
 
     if (worldbook) {
       sections.push(`【可选世界书背景】\n${worldbook}\n\n世界书只用于辨认人物、实体、称呼和背景，不得把其中内容直接当作本批新形成的人物记忆或实体更新。`);

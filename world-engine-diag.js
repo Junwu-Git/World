@@ -92,6 +92,17 @@ window.WORLD_ENGINE_DIAG = (function() {
       return sanitizeSettings(api.getSettings(true));
     });
 
+    // —— 错误历史（守卫捕获的引擎异常环形日志）——
+    diag.recentErrors = safe(function () {
+      const log = window.WORLD_ENGINE_ERROR_LOG;
+      const items = (log && log.list ? log.list() : []);
+      return {
+        count: items.length,
+        items: items.slice(-20),
+        lastEvolveError: (evo && evo.getLastError ? evo.getLastError() : '') || ''
+      };
+    });
+
     // —— 世界状态摘要 ——
     diag.worldState = safe(function () {
       if (!core || !core.loadState) return { error: 'core 模块不可用' };
