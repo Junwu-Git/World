@@ -22,6 +22,23 @@ queries 最多 4 条，每条不超过 30 个字，各自覆盖不同的检索�
   const clean = value => String(value == null ? '' : value).trim();
   const store = () => window.WORLD_ENGINE_STORE;
   const settings = () => window.MEMORY_ENGINE_SETTINGS?.getSettings(true) || {};
+  // 查询重写等 chat/completions 调用走生效 API 配置（跟随世界引擎时同主链路）；
+  // 向量/重排端点（vectorApiUrl/vectorApiKey）永远独立，不经此合并。
+  const apiSettings = () => window.MEMORY_ENGINE_SETTINGS?.getApiSettings?.() || settings();
+  // 向量/重排端点独立配置，但 URL/Key 留空时按「主 API」推导（设置页即如此写明）。
+  // 跟随世界引擎时主 API 是世界引擎，若仍拿记忆侧隐藏的旧 URL 推导，请求会静默发往旧供应商。
+  // 只回退 URL/Key：连接方式保持记忆侧（向量端点仅支持直连，跟随 world 的 proxy 会让整条链路报错），
+  // 超时也沿用记忆侧，避免独立向量供应商被世界引擎的超时绑死。
+  function vectorSettings() {
+    const own = settings();
+    if (own.apiSource !== 'world') return own;
+    const effective = apiSettings();
+    return {
+      ...own,
+      apiUrl: clean(own.vectorApiUrl) ? own.apiUrl : (effective.apiUrl || own.apiUrl),
+      apiKey: clean(own.vectorApiKey) ? own.apiKey : (effective.apiKey || own.apiKey)
+    };
+  }
   const vectorApi = () => window.WORLD_ENGINE_API;
   const chat = () => { try { return SillyTavern.getContext()?.chat || []; } catch (_) { return []; } };
   const getChatId = () => String(window.WORLD_ENGINE_CORE?.getChatId?.() || 'default');
@@ -105,7 +122,7 @@ queries 最多 4 条，每条不超过 30 个字，各自覆盖不同的检索�
 
   // 增量补齐缺漏/变更的纪要向量；force 时全部重嵌。
   async function ensureIndex(state, force) {
-    const st = settings();
+    const st = vectorSettings();
     const model = clean(st.vectorModel);
     if (!model) throw new Error('未配置向量模型');
     const cache = loadIndex();
@@ -181,6 +198,7 @@ queries 最多 4 条，每条不超过 30 个字，各自覆盖不同的检索�
   async function rewriteQueries(query, st) {
     const model = clean(st.vectorRewriteModel) || clean(st.model);
     if (!model) return { intent: '', queries: [query] };
+    // st 已是调用方传入的生效配置（含跟随世界引擎的连接参数）；此处只换模型与输出上限。
     const raw = await vectorApi().callApi(
       `${REWRITE_PROMPT}\n\n【最近对话】\n${query}`, 600, 0.1, recallAbort?.signal,
       { ...st, model, maxTokens: 600 }
@@ -195,7 +213,8 @@ queries 最多 4 条，每条不超过 30 个字，各自覆盖不同的检索�
 
   // ─── 召回主入口：生成前阻塞调用。 ───
   async function recallForGeneration() {
-    const st = settings();
+    // 向量/重排端点走 vectorSettings()：跟随世界引擎时，留空的 URL/Key 跟随主链路推导。
+    const st = vectorSettings();
     lastRecall = { items: [], at: Date.now(), intent: '', error: '' };
     if (st.vectorEnabled !== true || !clean(st.vectorModel)) { lastRecall.error = '未启用'; return lastRecall; }
     recallAbort = new AbortController();
@@ -214,7 +233,7 @@ queries 最多 4 条，每条不超过 30 个字，各自覆盖不同的检索�
 
       let intent = '', queries = [query];
       try {
-        const rewritten = await rewriteQueries(query, st);
+        const rewritten = await rewriteQueries(query, apiSettings());
         intent = rewritten.intent;
         queries = rewritten.queries;
       } catch (error) {
@@ -303,5 +322,5 @@ queries 最多 4 条，每条不超过 30 个字，各自覆盖不同的检索�
   }
 
   return { recallForGeneration, getLastRecall, getVectorStatus, scheduleIndexUpdate, rebuildIndex, abortRecall,
-    _test: { quantize, cosineInt8, base64FromInt8, int8FromBase64, buildRecallQuery } };
+    _test: { quantize, cosineInt8, base64FromInt8, int8FromBase64, buildRecallQuery, vectorSettings } };
 })();

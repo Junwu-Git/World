@@ -51,6 +51,18 @@ window.WORLD_ENGINE_UI = (function() {
   // 后台刷新空转跳过：记录上次重建的数据签名，未变化则不重建 DOM
   let _lastRefreshSig = null;
 
+  // 通用文本下载：预设导出、调试导出等多处共用，必须留在本 IIFE 顶层，
+  // 放进子作用域会让其他分支调用时抛 ReferenceError（预设「导出」曾因此失效）。
+  function setupDownload(content, filename) {
+    const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
   // 引擎面扩展点：新增引擎按注册顺序进入“下一界面”循环。
   // 可提供 render/bind、主题/版本、设置、运行状态、球体 class 与卫星按钮动作等钩子。
   function registerEngineFace(definition) {
@@ -1262,6 +1274,19 @@ window.WORLD_ENGINE_UI = (function() {
     syncTags();
   }
 
+  // 跟随世界引擎时的一行连接摘要：被跟随字段隐藏后，仍能看到请求实际发往哪里。
+  // 渲染与来源切换共用，避免两处口径漂移。
+  function memoryApiFollowStatusText() {
+    const world = window.WORLD_ENGINE_API?.getSettings?.(true) || {};
+    const url = String(world.apiUrl || '').trim();
+    if (!url) return '世界引擎尚未配置 API URL，请在「世界引擎 → 设置 → API」中填写；届时本引擎自动跟随。';
+    const mode = world.connectionMode === 'proxy' ? '经酒馆代理' : '直连';
+    const keyState = String(world.apiKey || '').trim() ? 'Key 已配置' : 'Key 未配置';
+    const tokens = Math.max(1, parseInt(world.maxTokens) || 65000);
+    const timeoutSec = Math.max(0, Math.round((Number(world.apiTimeoutMs) || 120000) / 1000));
+    return `当前使用世界引擎连接：${mode} · ${url} · ${keyState} · 模型上限 ${tokens} tokens · 超时 ${timeoutSec}s`;
+  }
+
   function renderMemorySettingsView() {
     const settings = window.MEMORY_ENGINE_SETTINGS?.getSettings(true) || {};
     const extra = renderSettingsAfterCheckpoint({ scope: 'memory' });
@@ -1289,41 +1314,68 @@ window.WORLD_ENGINE_UI = (function() {
     const apiTemperature = Number.isFinite(Number(settings.temperature)) ? Math.max(0, Number(settings.temperature)) : 0.2;
     const apiMaxTokens = Math.max(1, parseInt(settings.maxTokens) || 65000);
     const apiTimeoutSec = Math.max(0, Math.round((Number(settings.apiTimeoutMs) || 120000) / 1000));
+    // API 配置来源：'world'=跟随世界引擎（连接方式/URL/Key/温度/输出上限/超时取世界引擎设置，
+    // 模型仍独立）；向量端点永远独立，不受此开关影响。
+    const apiSource = settings.apiSource === 'world' ? 'world' : 'own';
+    const followWorld = apiSource === 'world';
+    const followHint = '跟随世界引擎：连接方式、URL、Key、温度、输出上限与超时均取世界引擎设置，只需在此选择模型。向量端点不受影响，仍用下方独立配置。';
+    const ownHint = '此处只配置记忆引擎；请求实现与世界引擎共用，但配置值互不覆盖。若两边相同，可切到「跟随世界引擎」免去重复填写。';
+    // 跟随模式下被跟随字段整体隐藏；隐藏字段里保留的是记忆侧自存值，保存时原样写回。
+    const showApiUrl = settings.apiUrl || '';
+    const showApiKey = settings.apiKey || '';
+    const showModel = settings.model || 'gpt-3.5-turbo';
+    const showTemperature = apiTemperature;
+    const showMaxTokens = apiMaxTokens;
+    const showTimeoutSec = apiTimeoutSec;
+    const showConnectionMode = settings.connectionMode === 'proxy' ? 'proxy' : 'direct';
 
     const apiBody = `
       <div class="we-input-group">
+        <label>API 配置来源</label>
+        <select id="we-memory-api-source" style="width:100%;">
+          <option value="own" ${followWorld ? '' : 'selected'}>独立配置（默认）</option>
+          <option value="world" ${followWorld ? 'selected' : ''}>跟随世界引擎（共用其 API 配置）</option>
+        </select>
+        <div style="font-size:11px;color:var(--we-text3);margin-top:3px;" id="we-memory-api-source-hint">${followWorld ? followHint : ownHint}</div>
+      </div>
+      <div class="we-input-group" id="we-memory-api-follow-status-group" ${followWorld ? '' : 'style="display:none;"'}>
+        <div style="font-size:12px;color:var(--we-text2);line-height:1.7;padding:8px 10px;background:var(--we-bg2,rgba(128,128,128,0.08));border-radius:6px;" id="we-memory-api-follow-status">${h(memoryApiFollowStatusText())}</div>
+      </div>
+      <div class="we-input-group" id="we-memory-api-connection-mode" ${followWorld ? 'style="display:none;"' : ''}>
         <label>连接方式</label>
         <select id="we-connection-mode" style="width:100%;">
-          <option value="direct" ${settings.connectionMode !== 'proxy' ? 'selected' : ''}>直连（默认）</option>
-          <option value="proxy" ${settings.connectionMode === 'proxy' ? 'selected' : ''}>经酒馆代理（解决跨域 CORS）</option>
+          <option value="direct" ${showConnectionMode !== 'proxy' ? 'selected' : ''}>直连（默认）</option>
+          <option value="proxy" ${showConnectionMode === 'proxy' ? 'selected' : ''}>经酒馆代理（解决跨域 CORS）</option>
         </select>
       </div>
-      <div class="we-input-group">
+      <div class="we-input-group" id="we-memory-api-url-group" ${followWorld ? 'style="display:none;"' : ''}>
         <label>记忆引擎 API URL（OpenAI 兼容）</label>
-        <input type="text" id="we-api-url" value="${u(settings.apiUrl || '')}" placeholder="https://api.openai.com/v1">
+        <input type="text" id="we-api-url" value="${u(showApiUrl)}" placeholder="https://api.openai.com/v1">
       </div>
-      <div class="we-input-group">
+      <div class="we-input-group" id="we-memory-api-key-group" ${followWorld ? 'style="display:none;"' : ''}>
         <label>记忆引擎 API Key</label>
-        <input type="password" id="we-api-key" value="${u(settings.apiKey || '')}">
+        <input type="password" id="we-api-key" value="${u(showApiKey)}">
       </div>
       <div class="we-input-group" style="display:flex;gap:6px;align-items:end;">
         <div style="flex:1;">
           <label>模型</label>
-          <input type="text" id="we-model" value="${u(settings.model || 'gpt-3.5-turbo')}" placeholder="模型名称" style="width:100%;">
+          <input type="text" id="we-model" value="${u(showModel)}" placeholder="模型名称" style="width:100%;">
         </div>
         <button class="we-btn" id="we-fetch-models" style="white-space:nowrap;flex-shrink:0;">获取列表</button>
       </div>
       <div class="we-input-group">
         <select id="we-model-list" style="display:none;width:100%;margin-top:4px;"><option value="">-- 选择模型 --</option></select>
       </div>
-      <div class="we-input-group" style="display:flex;gap:6px;">
-        <div style="flex:1;"><label>温度</label><input type="number" id="we-temperature" min="0" step="0.1" value="${apiTemperature}" style="width:100%;"></div>
-        <div style="flex:1;"><label>最大输出 token</label><input type="number" id="we-max-tokens" min="1" step="1" value="${apiMaxTokens}" style="width:100%;"></div>
+      <div class="we-input-group" id="we-memory-api-sampling-group" ${followWorld ? 'style="display:none;"' : ''}>
+        <div style="display:flex;gap:6px;">
+          <div style="flex:1;"><label>温度</label><input type="number" id="we-temperature" min="0" step="0.1" value="${showTemperature}" style="width:100%;"></div>
+          <div style="flex:1;"><label>最大输出 token</label><input type="number" id="we-max-tokens" min="1" step="1" value="${showMaxTokens}" style="width:100%;"></div>
+        </div>
       </div>
-      <div class="we-input-group">
+      <div class="we-input-group" id="we-memory-api-timeout-group" ${followWorld ? 'style="display:none;"' : ''}>
         <label>请求超时（秒）</label>
-        <input type="number" id="we-api-timeout-sec" min="0" step="1" value="${apiTimeoutSec}" style="width:100%;">
-        <div style="font-size:11px;color:var(--we-text3);margin-top:3px;">此处只配置记忆引擎；请求实现与世界引擎共用，但配置值互不覆盖。</div>
+        <input type="number" id="we-api-timeout-sec" min="0" step="1" value="${showTimeoutSec}" style="width:100%;">
+        <div style="font-size:11px;color:var(--we-text3);margin-top:3px;" id="we-memory-api-timeout-hint">此处只配置记忆引擎；请求实现与世界引擎共用，但配置值互不覆盖。</div>
       </div>`;
 
     const modeBody = `
@@ -1567,6 +1619,12 @@ window.WORLD_ENGINE_UI = (function() {
         </div>
       </div>
       <div class="we-section" style="margin-top:10px;">
+        <div class="we-section-title">v1.6.0 · API 配置可跟随世界引擎</div>
+        <ul class="we-changelog-items">
+          <li>「记忆引擎 API」区块新增「API 配置来源」：选「跟随世界引擎」后，连接方式、API URL、API Key、温度、最大输出 token 与请求超时全部取世界引擎设置，只需在此选择模型——两边用同一家 API 时不必重复填写。这些被跟随的字段会直接隐藏，改由一行连接摘要显示实际目标，随世界引擎侧变更自动生效；切回「独立配置」恢复上次自存值。向量端点始终独立，不跟随。</li>
+        </ul>
+      </div>
+      <div class="we-section" style="margin-top:10px;">
         <div class="we-section-title">v1.2.0 · 读取酒馆用户人设</div>
         <ul class="we-changelog-items">
           <li>「正文保留与推演参考」新增「读取酒馆用户人设」开关（默认关闭）：开启后，人物/实体提取前读取你在酒馆「用户设定」里填写的人设描述注入 prompt，便于判断用户作为知情人物（known_by）与其人际网络。纯只读；人设为空或你在酒馆把注入位置设为「不注入」时自动不注入。</li>
@@ -1632,16 +1690,17 @@ window.WORLD_ENGINE_UI = (function() {
           <input type="checkbox" id="we-memory-vector-enabled" ${settings.vectorEnabled === true ? 'checked' : ''}>
           启用远事召回（生成前向量检索久远纪要）
         </label>
-        <div style="font-size:11px;color:var(--we-text3);margin-top:3px;">生成前把最近对话改写成检索查询，从全部纪要的向量索引中召回窗口外的旧事注入【远事召回】节。仅支持直连端点；每次生成会额外发出 1-3 次请求（查询重写 + 查询向量 + 可选重排），重 roll 命中缓存不重复请求。Embedding 模型留空＝功能不生效。</div>
+        <div style="font-size:11px;color:var(--we-text3);margin-top:3px;">生成前把最近对话改写成检索查询，从全部纪要的向量索引中召回窗口外的旧事注入【远事召回】节。仅支持直连端点；每次生成会额外发出 1-3 次请求（查询重写 + 查询向量 + 可选重排），重 roll 命中缓存不重复请求。Embedding 模型留空＝功能不生效。查询重写走「API 配置来源」选定的连接，向量与重排端点始终用本区独立配置。</div>
       </div>
       <div class="we-subgroup">
         <div class="we-subgroup-title"><i class="fa-solid fa-plug"></i>向量连接与模型</div>
+        <div style="font-size:11px;color:var(--we-text3);margin-bottom:5px;">本节始终独立配置，不跟随世界引擎。</div>
         <div class="we-input-group">
-          <label>向量端点 URL（留空由记忆引擎 API URL 推导 /embeddings）</label>
+          <label>向量端点 URL（留空由主 API URL 推导 /embeddings）</label>
           <input type="text" id="we-memory-vector-url" value="${u(settings.vectorApiUrl || '')}" placeholder="https://api.example.com/v1/embeddings">
         </div>
         <div class="we-input-group">
-          <label>向量 API Key（留空复用记忆引擎 Key）</label>
+          <label>向量 API Key（留空复用主 API Key）</label>
           <input type="password" id="we-memory-vector-key" value="${u(settings.vectorApiKey || '')}">
         </div>
         <div class="we-input-group">
@@ -2219,6 +2278,7 @@ window.WORLD_ENGINE_UI = (function() {
   //   date    —— 可选，日期不确定的留月份/年份；
   //   items   —— 该版本改动条目（每条一行，渲染时走 h() 转义）。
   const CHANGELOG = [
+    { version: '3.5.1', date: '2026-10-19', items: ['记忆引擎 API 设置新增「配置来源」（记忆引擎设置 → 常用 → 记忆引擎 API）：选「跟随世界引擎」后，连接方式、API URL、API Key、温度、最大输出 token 与请求超时全部取世界引擎设置，只需在记忆侧选择模型——两边用同一家 API 时不必重复填写；这些字段在跟随模式下直接隐藏，改由一行连接摘要显示当前实际目标，随世界引擎侧变更自动生效，切换回「独立配置」恢复上次自存值。向量端点（远事召用的 URL/Key）始终独立配置，不跟随；查询重写等 chat 请求随主链路一起跟随。'] },
     { version: '3.5.0', date: '2026-10-17', items: ['新增「远事召回」（记忆引擎设置 → 高级）：把全部纪要建成向量索引（int8 量化本地存储），生成前把最近对话改写成检索查询、多路检索出窗口外的旧事并可经重排端点复序，超过相似度阈值的前几条注入【远事召回】节——久远剧情不再只剩总述概括。端点从记忆引擎 API 推导、可独立配置，仅直连；Embedding 模型留空＝不启用；重 roll 命中缓存不重复请求；任何一步失败都静默降级不阻断生成。', '新增「人物状态」档案：每轮联合提取顺带记录人物的可观察状态（所在位置、当前处境、对主角的外在态度，全部自由文本、不读心），进时间链可随删楼/改楼对账修复；最近楼层出现名字时注入【人物当前状态】节；记忆面板新增「人物状态」子页可查看与手动编辑。', '总述压缩支持多级：更早总述积压到阈值后自动合并成「最早总述」（深度上限三级），注入按「最早总述 → 更早总述 → 最近总述」分层呈现，世界联动回滚沿全链级联撤销。', '批量重填支持断点续填：人物/实体与纪要/总述两类重填的进度记入记忆状态，每批成功即推进断点，中途出错或手动停止后再次开始自动从断点楼层继续，不再清空成果推倒重来；设置页新增「从头重填」按钮，可清除进度回到从初始层整库重来的旧行为。'] },
     { version: '3.4.2', date: '2026-10-17', items: ['记忆引擎新增「更早总述」两级归档：未合并总述积压到阈值（默认 6，可调）后自动把保留窗口之外的最旧几条合并成更早总述，注入以「更早总述 + 最近总述」两级呈现，久远剧情不再随总述滚出注入窗口而丢失；对账修复、总述修复与世界联动回滚均支持级联处理，旧档自动兼容。', '纪要与总述记录起止剧情时间（模型输出 + 正文『』标签兜底 + 子条目继承），注入行以时间标注替代楼层号，能解析数字日期时附加「约 N 天前」相对距离前缀（架空纪年解析不了就不标，宁缺毋错）；面板卡片显示时间、编辑器可手动补时间，旧档无时间自动回退楼层号。', '记忆引擎请求容错加固：模型输出解析新增思维链剥离、智能引号归一、对白野引号补转义与超长字段截断四级清洗；提取请求附带既有记忆与实体既有事件清单，避免模型换措辞重复入库。', '自动提取改为从最老缺口轮补齐：某轮提取失败后不会永久漏出记忆链；批量重填某批失败自动降级为逐轮重填，单轮仍失败才中止并报告卡住的楼层；API 自动重试默认值改为 1 次（已保存过设置的保留原值）。', '注入未整理纪要新增条数上限（默认 10 条，可调），更早纪要正文保持可见不隐藏；注入首段增加私密简报说明，要求模型不复述、不向用户提及记忆内容。'] },
     { version: '3.4.1', date: '2026-10-15', items: ['「读取酒馆用户人设」取消开关、改为默认启用：推演与记忆提取始终读取你在酒馆「用户设定」里填写的人设描述，作为「{{user}} 的角色设定」注入 prompt（推演设置与记忆引擎设置里的两个开关已移除）；人设为空、读取失败或你在酒馆把人设注入位置设为「不注入」时依旧自动不注入。', '修复「从正文自动回填时间」读柏宝书 <bbs_end> 标签时取错时刻（同日）或错天（跨午夜）：配对原为非贪婪取第一个 <bbs_end>，模型思维链里常裸写「要加上完整的时间锚点 <bbs_start> 和 <bbs_end>」这类格式说明，配对会从提及处一路吃到真正的结束标签，再把段内第一个日期（往往是 <bbs_start> 的开始时刻）当成剧情结束时刻；若提及处自带一对无日期的标签，整楼还会被判成「有标签无日期」直接跳过。现改为按 </bbs_end> 闭标签从后往前配对（取最后一个带日期的配对），并对思维链与 HTML 注释先整块剥离——对裸提及、未闭合思维链、末尾无日期标签对均免疫。', '时间标签解析的思维链剥离放宽到 <think> 的任意变体（<think_nya~>、<think_cot> 等自定义标签此前整块留下，其中的旧日期会混进日期候选池）；正文里普通出现的「think」字样不受影响。', '标签日期识别补上点分隔写法（第四纪元7482.8.15），与正文日期解析口径一致。'] },
@@ -5269,6 +5329,30 @@ window.WORLD_ENGINE_UI = (function() {
       syncRawRetentionAvailability();
     }
 
+    // API 来源切换：被跟随字段立即置只读/解锁（保存前即时反馈，未保存的切换刷新面板会还原）。
+    const memoryApiSource = document.getElementById('we-memory-api-source');
+    if (memoryApiSource) {
+      const syncApiSourceAvailability = () => {
+        const follows = memoryApiSource.value === 'world';
+        // 跟随模式：被跟随字段整组隐藏，只留来源下拉、模型与获取列表。
+        for (const id of ['we-memory-api-connection-mode', 'we-memory-api-url-group', 'we-memory-api-key-group', 'we-memory-api-sampling-group', 'we-memory-api-timeout-group']) {
+          const element = document.getElementById(id);
+          if (element) element.style.display = follows ? 'none' : '';
+        }
+        const hint = document.getElementById('we-memory-api-source-hint');
+        if (hint) hint.textContent = follows
+          ? '跟随世界引擎：连接方式、URL、Key、温度、输出上限与超时均取世界引擎设置，只需在此选择模型。向量端点不受影响，仍用下方独立配置。'
+          : '此处只配置记忆引擎；请求实现与世界引擎共用，但配置值互不覆盖。若两边相同，可切到「跟随世界引擎」免去重复填写。';
+        // 跟随状态摘要：隐藏字段后仍能看到请求实际发往哪里；未保存的切换刷新面板会还原。
+        const statusGroup = document.getElementById('we-memory-api-follow-status-group');
+        if (statusGroup) statusGroup.style.display = follows ? '' : 'none';
+        const status = document.getElementById('we-memory-api-follow-status');
+        if (status && follows) status.textContent = memoryApiFollowStatusText();
+      };
+      memoryApiSource.onchange = syncApiSourceAvailability;
+      syncApiSourceAvailability();
+    }
+
     const memorySaveBtn = document.getElementById('we-save-memory-settings');
     if (memorySaveBtn) {
       memorySaveBtn.onclick = () => {
@@ -5276,12 +5360,16 @@ window.WORLD_ENGINE_UI = (function() {
         const memoryCurrent = window.MEMORY_ENGINE_SETTINGS?.getSettings(true) || {};
         const temperatureRaw = parseFloat(gv('we-temperature'));
         const timeoutSecRaw = parseFloat(gv('we-api-timeout-sec'));
+        // 跟随世界引擎时被跟随字段整组隐藏，输入框里保留的仍是记忆侧自存值（不是世界引擎值），
+        // 保存时原样写回，切回「独立配置」即恢复用户自己的配置。
+        const apiFollowsWorld = document.getElementById('we-memory-api-source')?.value === 'world';
         const memorySettings = {
           ...memoryCurrent,
           engineEnabled: document.getElementById('we-memory-engine-enabled')?.checked !== false,
           firstLayerIsAiOpening: document.getElementById('we-memory-first-layer-ai-opening')?.checked !== false,
-          apiUrl: gv('we-api-url') || '',
-          apiKey: gv('we-api-key') || '',
+          apiSource: apiFollowsWorld ? 'world' : 'own',
+          apiUrl: apiFollowsWorld ? (memoryCurrent.apiUrl || '') : (gv('we-api-url') || ''),
+          apiKey: apiFollowsWorld ? (memoryCurrent.apiKey || '') : (gv('we-api-key') || ''),
           model: gv('we-model') || 'gpt-3.5-turbo',
           temperature: Number.isFinite(temperatureRaw) ? Math.max(0, temperatureRaw) : 0.2,
           maxTokens: Math.max(1, parseInt(gv('we-max-tokens')) || 65000),
@@ -5618,13 +5706,12 @@ window.WORLD_ENGINE_UI = (function() {
         if (window.WORLD_ENGINE_API?.patchSettings) window.WORLD_ENGINE_API.patchSettings(ns);
 
         // [FIX] 保存后校验正则过滤：复用 core.validateFilterRegex。非法条目不阻止保存（与现有数值 clamp 范式一致），
-        //   但在状态行展示生效/失败+原因，按是否有失败调整下方 toast。
+        //   校验结果用于调整下方 toast。状态行渲染函数只存在于旧版内联绑定（if (false) 段），不再调用。
         let _filterBad = 0;
         try {
           const _core = window.WORLD_ENGINE_CORE;
           if (_core && _core.validateFilterRegex) {
             const _v = _core.validateFilterRegex(ns.evolveFilterRegex);
-            renderFilterStatus(_v, '已保存：');
             _filterBad = _v.bad.length;
           }
         } catch (e) { /* 校验失败不影响保存 */ }
@@ -6082,31 +6169,39 @@ window.WORLD_ENGINE_UI = (function() {
         if (!api) { showToast('API 模块未加载', true); return; }
         const requestScope = _engineFace;
         const modelListElement = document.getElementById('we-model-list');
-        const apiPatch = {
-          apiUrl: document.getElementById('we-api-url')?.value || '',
-          apiKey: document.getElementById('we-api-key')?.value || '',
-          model: document.getElementById('we-model')?.value || '',
-          temperature: Number.isFinite(parseFloat(document.getElementById('we-temperature')?.value))
-            ? Math.max(0, parseFloat(document.getElementById('we-temperature')?.value))
-            : (requestScope === 'memory' ? 0.2 : 0.7),
-          maxTokens: Math.max(1, parseInt(document.getElementById('we-max-tokens')?.value) || 65000),
-          apiTimeoutMs: Number.isFinite(parseFloat(document.getElementById('we-api-timeout-sec')?.value)) ? Math.max(0, Math.round(parseFloat(document.getElementById('we-api-timeout-sec')?.value) * 1000)) : 120000,
-          connectionMode: document.getElementById('we-connection-mode')?.value === 'proxy' ? 'proxy' : 'direct'
-        };
+        const apiFollowsWorld = requestScope === 'memory'
+          && document.getElementById('we-memory-api-source')?.value === 'world';
+        // 记忆引擎跟随世界引擎时，被跟随字段整组隐藏，不得写回记忆侧；直接用世界引擎配置拉列表。
+        // 传入下拉当前值：先切换来源、未保存就点「获取列表」时也要按屏幕上的来源发请求。
         let requestSettings;
-        if (requestScope === 'memory') {
-          requestSettings = window.MEMORY_ENGINE_SETTINGS?.patchSettings(apiPatch) || apiPatch;
+        if (apiFollowsWorld) {
+          requestSettings = window.MEMORY_ENGINE_SETTINGS?.getApiSettings?.(true, 'world') || {};
         } else {
-          const worldSettings = {
-            ...(api.getSettings ? api.getSettings(true) : {}),
-            ...apiPatch,
-            injectIntoPrompt: document.getElementById('we-inject-into-prompt')?.checked !== false,
-            injectMaxChars: Math.max(0, parseInt(document.getElementById('we-inject-max-chars')?.value) || 0),
-            injectAllLevels: document.getElementById('we-inject-all-levels')?.checked === true
+          const apiPatch = {
+            apiUrl: document.getElementById('we-api-url')?.value || '',
+            apiKey: document.getElementById('we-api-key')?.value || '',
+            model: document.getElementById('we-model')?.value || '',
+            temperature: Number.isFinite(parseFloat(document.getElementById('we-temperature')?.value))
+              ? Math.max(0, parseFloat(document.getElementById('we-temperature')?.value))
+              : (requestScope === 'memory' ? 0.2 : 0.7),
+            maxTokens: Math.max(1, parseInt(document.getElementById('we-max-tokens')?.value) || 65000),
+            apiTimeoutMs: Number.isFinite(parseFloat(document.getElementById('we-api-timeout-sec')?.value)) ? Math.max(0, Math.round(parseFloat(document.getElementById('we-api-timeout-sec')?.value) * 1000)) : 120000,
+            connectionMode: document.getElementById('we-connection-mode')?.value === 'proxy' ? 'proxy' : 'direct'
           };
-          requestSettings = window.WORLD_ENGINE_API?.patchSettings
-            ? window.WORLD_ENGINE_API.patchSettings(worldSettings)
-            : worldSettings;
+          if (requestScope === 'memory') {
+            requestSettings = window.MEMORY_ENGINE_SETTINGS?.patchSettings(apiPatch) || apiPatch;
+          } else {
+            const worldSettings = {
+              ...(api.getSettings ? api.getSettings(true) : {}),
+              ...apiPatch,
+              injectIntoPrompt: document.getElementById('we-inject-into-prompt')?.checked !== false,
+              injectMaxChars: Math.max(0, parseInt(document.getElementById('we-inject-max-chars')?.value) || 0),
+              injectAllLevels: document.getElementById('we-inject-all-levels')?.checked === true
+            };
+            requestSettings = window.WORLD_ENGINE_API?.patchSettings
+              ? window.WORLD_ENGINE_API.patchSettings(worldSettings)
+              : worldSettings;
+          }
         }
         fetchBtn.disabled = true;
         fetchBtn.textContent = '获取中...';
@@ -6408,17 +6503,6 @@ window.WORLD_ENGINE_UI = (function() {
         if (evolution && evolution.abort) { evolution.abort(); showToast('已发送停止信号'); }
       };
     })();
-
-    // 调试区导出按钮
-    function setupDownload(content, filename) {
-      const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = filename;
-      a.click();
-      URL.revokeObjectURL(url);
-    }
 
     const exportPromptBtn = document.getElementById('we-export-prompt');
     if (exportPromptBtn) {

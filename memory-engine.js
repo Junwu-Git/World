@@ -24,6 +24,8 @@ window.MEMORY_ENGINE = (function() {
   const MAX_SUMMARY_LEVEL = 3;
   const SUMMARY_LEVEL_LABELS = { 2: '更早总述', 3: '最早总述' };
   const settings = () => window.MEMORY_ENGINE_SETTINGS?.getSettings(true) || {};
+  // 生效的 API 连接配置：apiSource='world' 时 URL/Key/连接方式/温度/输出上限/超时跟随世界引擎。
+  const apiSettings = () => window.MEMORY_ENGINE_SETTINGS?.getApiSettings?.() || settings();
   const data = () => window.MEMORY_ENGINE_DATA;
   const timelineApi = () => window.MEMORY_ENGINE_TIMELINE;
   function setExternalStatus(text, isError) {
@@ -1062,11 +1064,16 @@ window.MEMORY_ENGINE = (function() {
     if (!memoryData) return null;
     const state = memoryData.loadState();
     const eventMemory = ensureEventState(state);
-    const storedLayer = Number(eventMemory.small_summary_layer);
+    const storedRaw = eventMemory.small_summary_layer;
+    const storedLayer = Number(storedRaw);
+    // 空值必须先排除：Number(null) 与 Number('') 都是 0，会被误判成「已记录到第 0 层」，
+    // 于是新聊天永远不落基线，整段历史被自动提取当成待办。
+    const hasBaseline = storedRaw !== null && storedRaw !== ''
+      && Number.isFinite(storedLayer) && storedLayer >= 0;
     // 聊天未就绪（0 条消息）时不落基线：写入 -1 会让后续判断永远视为已初始化。
     const chatLength = chat().length;
     if (chatLength <= 0) return state;
-    if (Number.isFinite(storedLayer) && storedLayer >= 0) return state;
+    if (hasBaseline) return state;
     eventMemory.small_summary_layer = chatLength - 1;
     return memoryData.saveState(state);
   }
@@ -1088,7 +1095,7 @@ window.MEMORY_ENGINE = (function() {
   }
 
   async function requestTasks(tasks, options) {
-    const st = settings(), state = options?.baseState ? clone(options.baseState) : data().loadState();
+    const st = settings(), apiSt = apiSettings(), state = options?.baseState ? clone(options.baseState) : data().loadState();
     const rawPrompt = await buildRequestPrompt(tasks, state, st);
     // 与 callApi 出口同一展开：{{user}}、<user> → 酒馆设定的 user 名称。
     // 此处展开让调试镜像（lastDebug.prompt）与实际发出的请求字节级一致。
@@ -1099,7 +1106,7 @@ window.MEMORY_ENGINE = (function() {
     for (let attempt = 0; attempt <= retries; attempt++) {
       try {
         const raw = await window.WORLD_ENGINE_API.callApi(
-          prompt, st.maxTokens, st.temperature, abortController?.signal, st
+          prompt, apiSt.maxTokens, apiSt.temperature, abortController?.signal, apiSt
         );
         lastDebug.rawResult = lastDebug.apiResponse = raw;
         const parsed = parseResponse(raw, tasks);
@@ -2256,7 +2263,7 @@ window.MEMORY_ENGINE = (function() {
     if (backfillRunning) throw new Error('记忆引擎正在批量重填，暂不能执行世界联动');
     const layer = Number.isFinite(Number(payload?.layer)) ? Number(payload.layer) : currentLayer();
     // 普通记忆提取先开始时，等待它完整落库；不得并发读取同一基底后互相覆盖。
-    const deadline = Date.now() + Math.max(10000, Number(st.apiTimeoutMs) || 120000);
+    const deadline = Date.now() + Math.max(10000, Number(apiSettings().apiTimeoutMs) || 120000);
     while (running && Date.now() < deadline) await delay(100);
     if (running) throw new Error('等待当前记忆任务结束超时');
     if (payload?.replace === true) rollbackLinkedLayer(layer);

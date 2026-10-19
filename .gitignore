@@ -1,3 +1,10 @@
 .claude/
 .mimosa/
 .zcode/
+
+# 开发环境
+node_modules/
+.npm-cache/
+.eslintcache
+.dsh-acl-repair/
+*.log

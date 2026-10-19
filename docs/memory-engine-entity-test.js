@@ -42,6 +42,7 @@ function assert(condition, message) {
   if (!condition) throw new Error(message);
 }
 
+/* global MEMORY_ENGINE, MEMORY_ENGINE_DATA -- 由被测模块挂在 global 上的运行时对象 */
 async function run() {
   storage.set('memory_engine_state_entity-test', JSON.stringify({
     personal_memory: [], knowledge_index: {},

@@ -980,7 +980,8 @@ ${JSON.stringify(sample || [], null, 2)}
   blackbox: state.blackbox || { secretActions: [], secretAssets: [] }
 }, null, 2)}`;
 
-    const segDialogue = `## 近期对话\n${dialogueText ? dialogueText : `用户：${userMsg || ''}\nAI：${aiMsg || ''}`}`;
+    // 开启 promptBudgetChars 后下面的 track() 会回写 segDialogue，必须是 let。
+    let segDialogue = `## 近期对话\n${dialogueText ? dialogueText : `用户：${userMsg || ''}\nAI：${aiMsg || ''}`}`;
 
     let segExtraInstruction = extraInstruction ? extraInstruction : '';
     // toneSection 已含前导 \n\n；segments 存原始 toneSection，与实际发出一致
