@@ -1,14 +1,14 @@
 // memory-engine-settings.js — 记忆引擎独立设置（只复用 API/调度等实现，不共享配置值）
 window.MEMORY_ENGINE_SETTINGS = (function() {
   const STORAGE_KEY = 'memory_engine_settings';
-  const VERSION = '1.6.0';
+  const VERSION = '1.6.1';
   // API 连接配置来源：'own'=记忆引擎独立配置（默认，旧行为）；
-  // 'world'=跟随世界引擎，apiUrl/apiKey/connectionMode/temperature/maxTokens/apiTimeoutMs 取世界引擎设置，
-  // 模型仍由记忆侧独立选择。向量端点（vectorApiUrl/vectorApiKey）永远独立，不跟随。
+  // 'world'=跟随世界引擎，apiUrl/apiKey/model/connectionMode/temperature/maxTokens/apiTimeoutMs
+  // 全部取世界引擎设置，记忆侧不再单独选模型。向量端点（vectorApiUrl/vectorApiKey）永远独立，不跟随。
   const API_SOURCES = Object.freeze(['own', 'world']);
   // 跟随世界引擎时被覆盖的字段；保存侧同样跳过这些字段，避免旧值覆盖世界引擎配置的展示。
   const API_FOLLOW_FIELDS = Object.freeze([
-    'apiUrl', 'apiKey', 'connectionMode', 'temperature', 'maxTokens', 'apiTimeoutMs'
+    'apiUrl', 'apiKey', 'model', 'connectionMode', 'temperature', 'maxTokens', 'apiTimeoutMs'
   ]);
   const DEFAULTS = Object.freeze({
     apiSource: 'own',
@@ -146,7 +146,7 @@ window.MEMORY_ENGINE_SETTINGS = (function() {
   }
 
   // 生效的 API 连接配置：跟随世界引擎时，被跟随字段整体取世界引擎当前值（缺失字段回退记忆侧已存值，
-  // 保证世界引擎未配置时不至于把 URL/Key 清空）；模型与向量端点始终来自记忆侧。
+  // 保证世界引擎未配置时不至于把 URL/Key/模型清空）；向量端点始终来自记忆侧。
   // 跟随模式下必须每次重读：用户随时可能在世界引擎侧改连接配置，缓存会让记忆引擎继续用旧值。
   // 默认强刷记忆侧设置；世界引擎侧 getSettings(true) 本身即强刷。
   // sourceOverride 供 UI 在「已切换但尚未保存」时按屏幕上选中的来源取配置，

@@ -206,6 +206,7 @@ window.MEMORY_ENGINE_PROMPT = (function() {
       : [];
     const worldbook = clean(input.worldbook);
     const referenceContext = clean(input.referenceContext);
+    const persona = clean(input.persona);
     const conversation = clean(input.conversation);
 
     const sections = [
@@ -213,6 +214,12 @@ window.MEMORY_ENGINE_PROMPT = (function() {
       `【已知人物名称与别名】\n${knownPeople.length ? knownPeople.map(item => `- ${item}`).join('\n') : '未提供；仅使用对话中明确出现的称呼'}`,
       `【已知实体】\n${knownEntities.length ? knownEntities.join('\n') : '未提供；仅提取对话中明确命名且符合分类定义的实体'}`
     ];
+
+    // 用户人设只作为身份/关系/知情范围的参照，放在已知信息之后、对话之前；
+    // 不得据此虚构本批未发生的事件，避免模型把人设当成本轮剧情来源。
+    if (persona) {
+      sections.push(`【只读参照·用户人设】\n${persona}\n\n以上设定只用于辨认 {{user}} 的身份、关系与知情范围；不得据此虚构本批未发生的事件，也不得把设定内容直接写成本批新增记忆。`);
+    }
 
     if (knownNpcProfiles.length) {
       sections.push(`【已知人物状态】\n${knownNpcProfiles.join('\n')}\n\n以上是既有的人物状态记录，供辨认与增量更新；只有本批对话明确观察到变化时才更新对应字段，未观察到的字段留空。`);

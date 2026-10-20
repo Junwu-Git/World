@@ -5,7 +5,7 @@
 世界引擎与记忆引擎共用同一套 API 请求实现（`world-engine-api.js` 的 `callApi`/`callEmbeddings`/`callRerank`），
 但连接配置值各自独立存储：世界引擎读 `world_engine_settings`，记忆引擎读 `memory_engine_settings`，
 设置页也是两个独立表单。两边用同一家 API 时，用户要在两个面板重复填写
-URL / Key / 连接方式 / 温度 / 最大输出 token / 请求超时共 6 组字段。
+URL / Key / 模型 / 连接方式 / 温度 / 最大输出 token / 请求超时共 7 组字段。
 
 原设计有意保持两套配置隔离（见 `world-engine-api.js:3` 的注释：
 「请求实现可以被两个引擎复用，但覆盖配置绝不能以世界引擎设置补缺」），
@@ -19,10 +19,9 @@ URL / Key / 连接方式 / 温度 / 最大输出 token / 请求超时共 6 组�
 - `world`：跟随世界引擎。
 
 跟随模式下被覆盖的字段（`memory-engine-settings.js` 的 `API_FOLLOW_FIELDS`）：
-`apiUrl`、`apiKey`、`connectionMode`、`temperature`、`maxTokens`、`apiTimeoutMs`。
+`apiUrl`、`apiKey`、`model`、`connectionMode`、`temperature`、`maxTokens`、`apiTimeoutMs`。
 
 不跟随的字段：
-- `model`：记忆提取与推演的 prompt 结构不同，模型经常需要分别选（如记忆侧用长上下文模型）。
 - 向量子系统全部端点配置：`vectorApiUrl`、`vectorApiKey`、`vectorRerankUrl`、`vectorRerankKey`。
   向量端点可能指向另一家供应商（如专用 embedding 服务），且用户明确要求不跟随。
 
@@ -32,7 +31,7 @@ URL / Key / 连接方式 / 温度 / 最大输出 token / 请求超时共 6 组�
 
 - `own`：直接返回记忆侧设置。
 - `world`：以记忆侧设置为底，逐字段覆盖为世界引擎当前值；世界引擎侧该字段为空时
-  保留记忆侧已存值（避免世界引擎未配置时把 URL/Key 清成空）。
+  保留记忆侧已存值（避免世界引擎未配置时把 URL/Key/模型清成空）。
 - 每次调用都强刷两侧缓存（`getSettings(true)` + `WORLD_ENGINE_API.getSettings(true)`）：
   用户随时可能在世界引擎侧改配置，缓存会让记忆引擎继续用旧值。
 
@@ -42,18 +41,18 @@ URL / Key / 连接方式 / 温度 / 最大输出 token / 请求超时共 6 组�
 | --- | --- |
 | `memory-engine.js` `requestTasks` | `callApi` 的覆盖参数由 `settings()` 改为 `apiSettings()` |
 | `memory-engine.js` `ingestWorldEvolution` | 等待超时的 `apiTimeoutMs` 取 `apiSettings()` |
-| `memory-engine-vector.js` `rewriteQueries` | 查询重写的连接参数取 `apiSettings()`（model 仍由 `vectorRewriteModel`/`model` 决定） |
+| `memory-engine-vector.js` `rewriteQueries` | 查询重写的连接参数取 `apiSettings()`（跟随模式下 `model` 也取世界引擎模型；`vectorRewriteModel` 非空时仍以它覆盖） |
 | `memory-engine-vector.js` 索引/检索/重排 | 仍用记忆侧 `settings()`，向量端点保持独立 |
 
 ## UI 行为
 
 - 来源下拉 `#we-memory-api-source`，切换时立即隐藏/恢复被跟随字段组（`syncApiSourceAvailability`），
   不等保存。
-- 跟随模式下被跟随字段**整组隐藏**（连接方式、URL、Key、温度与输出上限、超时），只留来源下拉、
-  模型选择与「获取列表」；隐藏字段里保留的仍是记忆侧自存值，不展示世界引擎的值。
+- 跟随模式下被跟随字段**整组隐藏**（连接方式、URL、Key、模型与获取列表、温度与输出上限、超时），
+  只留来源下拉与连接摘要；隐藏字段里保留的仍是记忆侧自存值，不展示世界引擎的值。
 - 隐藏后由一行只读状态摘要说明当前实际连接：连接方式 · URL · Key 是否已配置 ·
-  模型上限 · 超时；世界引擎未配置 URL 时提示去世界引擎设置填写。
-- 保存时：`apiSource` 写入新值，被跟随字段原样写回记忆侧自存值（不是世界引擎的值），
+  模型 · 输出上限 · 超时；世界引擎未配置 URL 时提示去世界引擎设置填写。
+- 保存时：`apiSource` 写入新值，被跟随字段（含模型）原样写回记忆侧自存值（不是世界引擎的值），
   这样切回 `own` 时恢复的是用户自己的配置。
 - 「获取列表」按钮：跟随模式用 `getApiSettings(true, 'world')` 直接拉世界引擎的模型列表，
   且不得把记忆侧的旧值 `patchSettings` 回写。第二个参数是「来源覆盖」：下拉已切到跟随、
@@ -81,7 +80,7 @@ URL / Key / 连接方式 / 温度 / 最大输出 token / 请求超时共 6 组�
 加载线上 `memory-engine-settings.js`，通过 `WORLD_ENGINE_STORE` 提供两侧配置，覆盖
 
 1. `own` 模式自存配置原样生效；
-2. `world` 模式六个跟随字段取世界引擎、model 与向量端点保持记忆侧；
+2. `world` 模式七个跟随字段（含 model）取世界引擎、向量端点保持记忆侧；
 3. 世界引擎字段为空时回退记忆侧已存值；
 4. 非法 `apiSource` 归一为 `own`；
 5. 保存侧语义（跟随时保留自存字段，切回 `own` 恢复）；
@@ -91,12 +90,13 @@ URL / Key / 连接方式 / 温度 / 最大输出 token / 请求超时共 6 组�
 9. UI 源码接线断言（来源下拉、整组隐藏、保存分支、获取列表分支、向量区提示）。
 
 `docs/memory-api-follow-e2e-test.js`（`node docs/memory-api-follow-e2e-test.js`）：
-加载完整记忆引擎并手动提取，断言真正发往 `callApi` 的 URL/Key/连接方式/温度/输出上限/超时
-就是跟随后的值、世界引擎侧改值后下一次请求立即生效、切回 `own` 后回到记忆侧自存值。
+加载完整记忆引擎并手动提取，断言真正发往 `callApi` 的 URL/Key/模型/连接方式/温度/输出上限/超时
+就是跟随后的值、世界引擎侧改值后下一次请求立即生效、切回 `own` 后回到记忆侧自存值；
+同时断言「用户人设」作为只读参照位于任务说明与已知信息之后，而不是请求开头。
 
 ## 已知限制
 
-- 跟随模式下被跟随字段全部隐藏，用户无法在记忆侧看到或微调温度/输出上限/超时，
+- 跟随模式下被跟随字段全部隐藏，用户无法在记忆侧看到或微调模型/温度/输出上限/超时，
   需要到世界引擎设置里改——这是刻意的，避免两处配置看起来可改实际不生效。
 - 向量端点为空时由主 API URL 推导 `/embeddings`，跟随模式下推导用的是世界引擎的 URL
   （见上文「向量端点留空时的推导」）：同供应商场景属合理行为，但意味着向量端点会

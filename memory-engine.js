@@ -281,17 +281,6 @@ window.MEMORY_ENGINE = (function() {
 
   async function buildRequestPrompt(tasks, state, st) {
     const segments = [];
-    // 用户人设（酒馆「用户设定」里的 persona 描述）：只读参照，只进人物/实体提取任务
-    // （known_by 归属、用户作为知情人物等判定需要知道{{user}}是谁）。人称为空、
-    // 用户在酒馆把注入位置设为「不注入」或读取失败时一律为空，不阻断提取。
-    if (tasks.memory) {
-      try {
-        const personaSection = await window.WORLD_ENGINE_CORE?.buildPersonaSection?.() || '';
-        if (personaSection) segments.push(personaSection);
-      } catch (error) {
-        console.error('[记忆引擎] 读取用户人设失败（已隔离）', error);
-      }
-    }
     const memoryReference = tasks.memory ? buildTaskReferenceContext(state, tasks.memory, st) : null;
     const sharesReference = Boolean(tasks.memory && tasks.small
       && Number(tasks.memory.startLayer) === Number(tasks.small.startLayer)
@@ -304,8 +293,18 @@ window.MEMORY_ENGINE = (function() {
       if (st.worldbookEnabled && window.WORLD_ENGINE_WORLDBOOK?.buildPromptSection) {
         worldbook = await window.WORLD_ENGINE_WORLDBOOK.buildPromptSection(filtered, 'memory');
       }
+      // 用户人设（酒馆「用户设定」里的 persona 描述）：只读参照，只进人物/实体提取任务
+      // （known_by 归属、用户作为知情人物等判定需要知道{{user}}是谁）。放在任务说明与
+      // 已知信息之后、对话之前，不抢在系统规则前面；读取失败或用户在酒馆关闭注入时为空。
+      let persona = '';
+      try {
+        persona = await window.WORLD_ENGINE_CORE?.buildPersonaSection?.() || '';
+      } catch (error) {
+        console.error('[记忆引擎] 读取用户人设失败（已隔离）', error);
+      }
       const user = window.MEMORY_ENGINE_PROMPT.buildUserPrompt({
         currentStoryTime: extractStoryTime(filtered),
+        persona,
         knownPeople: (state.personal_memory || []).map(character => unique(character.names)),
         knownEntities: ENTITY_TYPES.flatMap(type => (state.entity_memory?.[type] || []).map(entity => ({
           type: ENTITY_LABELS[type], name: entity.name, aliases: unique(entity.aliases), description: entity.description,

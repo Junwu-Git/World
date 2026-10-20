@@ -1,6 +1,6 @@
 {
   "name": "sillytavern-world-engine",
-  "version": "3.5.1",
+  "version": "3.5.2",
   "private": true,
   "type": "module",
   "description": "SillyTavern 第三方扩展「世界引擎」的本地开发环境（不参与扩展运行）",

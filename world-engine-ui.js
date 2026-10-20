@@ -1282,9 +1282,10 @@ window.WORLD_ENGINE_UI = (function() {
     if (!url) return '世界引擎尚未配置 API URL，请在「世界引擎 → 设置 → API」中填写；届时本引擎自动跟随。';
     const mode = world.connectionMode === 'proxy' ? '经酒馆代理' : '直连';
     const keyState = String(world.apiKey || '').trim() ? 'Key 已配置' : 'Key 未配置';
+    const model = String(world.model || '').trim() || '未配置';
     const tokens = Math.max(1, parseInt(world.maxTokens) || 65000);
     const timeoutSec = Math.max(0, Math.round((Number(world.apiTimeoutMs) || 120000) / 1000));
-    return `当前使用世界引擎连接：${mode} · ${url} · ${keyState} · 模型上限 ${tokens} tokens · 超时 ${timeoutSec}s`;
+    return `当前使用世界引擎连接：${mode} · ${url} · ${keyState} · 模型 ${model} · 输出上限 ${tokens} tokens · 超时 ${timeoutSec}s`;
   }
 
   function renderMemorySettingsView() {
@@ -1314,11 +1315,11 @@ window.WORLD_ENGINE_UI = (function() {
     const apiTemperature = Number.isFinite(Number(settings.temperature)) ? Math.max(0, Number(settings.temperature)) : 0.2;
     const apiMaxTokens = Math.max(1, parseInt(settings.maxTokens) || 65000);
     const apiTimeoutSec = Math.max(0, Math.round((Number(settings.apiTimeoutMs) || 120000) / 1000));
-    // API 配置来源：'world'=跟随世界引擎（连接方式/URL/Key/温度/输出上限/超时取世界引擎设置，
-    // 模型仍独立）；向量端点永远独立，不受此开关影响。
+    // API 配置来源：'world'=跟随世界引擎（连接方式/URL/Key/模型/温度/输出上限/超时取世界引擎设置，
+    // 模型不再由记忆侧单独选择）；向量端点永远独立，不受此开关影响。
     const apiSource = settings.apiSource === 'world' ? 'world' : 'own';
     const followWorld = apiSource === 'world';
-    const followHint = '跟随世界引擎：连接方式、URL、Key、温度、输出上限与超时均取世界引擎设置，只需在此选择模型。向量端点不受影响，仍用下方独立配置。';
+    const followHint = '跟随世界引擎：连接方式、URL、Key、模型、温度、输出上限与超时均取世界引擎设置，连接摘要会显示当前模型。向量端点不受影响，仍用下方独立配置。';
     const ownHint = '此处只配置记忆引擎；请求实现与世界引擎共用，但配置值互不覆盖。若两边相同，可切到「跟随世界引擎」免去重复填写。';
     // 跟随模式下被跟随字段整体隐藏；隐藏字段里保留的是记忆侧自存值，保存时原样写回。
     const showApiUrl = settings.apiUrl || '';
@@ -1356,14 +1357,14 @@ window.WORLD_ENGINE_UI = (function() {
         <label>记忆引擎 API Key</label>
         <input type="password" id="we-api-key" value="${u(showApiKey)}">
       </div>
-      <div class="we-input-group" style="display:flex;gap:6px;align-items:end;">
+      <div class="we-input-group" id="we-memory-api-model-group" style="gap:6px;align-items:end;${followWorld ? 'display:none;' : 'display:flex;'}">
         <div style="flex:1;">
           <label>模型</label>
           <input type="text" id="we-model" value="${u(showModel)}" placeholder="模型名称" style="width:100%;">
         </div>
         <button class="we-btn" id="we-fetch-models" style="white-space:nowrap;flex-shrink:0;">获取列表</button>
       </div>
-      <div class="we-input-group">
+      <div class="we-input-group" id="we-memory-api-model-list-group" ${followWorld ? 'style="display:none;"' : ''}>
         <select id="we-model-list" style="display:none;width:100%;margin-top:4px;"><option value="">-- 选择模型 --</option></select>
       </div>
       <div class="we-input-group" id="we-memory-api-sampling-group" ${followWorld ? 'style="display:none;"' : ''}>
@@ -1617,6 +1618,13 @@ window.WORLD_ENGINE_UI = (function() {
         <div style="font-size:12px;color:var(--we-text2);line-height:1.7;">
           面向长篇对话的独立记忆系统。人物记忆保留知情人边界，实体记忆维护组织、物件、能力与地点的当前状态和历史；纪要按新增轮次记录阶段事件，总述再将多条纪要压缩为长期脉络。
         </div>
+      </div>
+      <div class="we-section" style="margin-top:10px;">
+        <div class="we-section-title">v1.6.1 · 跟随时模型也跟随</div>
+        <ul class="we-changelog-items">
+          <li>记忆引擎选择「跟随世界引擎」后，模型也直接使用世界引擎当前模型，记忆侧的模型输入与「获取列表」一并隐藏，连接摘要中会显示实际使用的模型；切回「独立配置」仍恢复记忆侧上次自选的模型。</li>
+          <li>用户人设段改为任务说明与已知信息之后的只读参照，不再放在请求最前面，避免压过提取规则。</li>
+        </ul>
       </div>
       <div class="we-section" style="margin-top:10px;">
         <div class="we-section-title">v1.6.0 · API 配置可跟随世界引擎</div>
@@ -5334,14 +5342,17 @@ window.WORLD_ENGINE_UI = (function() {
     if (memoryApiSource) {
       const syncApiSourceAvailability = () => {
         const follows = memoryApiSource.value === 'world';
-        // 跟随模式：被跟随字段整组隐藏，只留来源下拉、模型与获取列表。
-        for (const id of ['we-memory-api-connection-mode', 'we-memory-api-url-group', 'we-memory-api-key-group', 'we-memory-api-sampling-group', 'we-memory-api-timeout-group']) {
+        // 跟随模式：被跟随字段整组隐藏，只留来源下拉与连接摘要。
+        for (const id of ['we-memory-api-connection-mode', 'we-memory-api-url-group', 'we-memory-api-key-group', 'we-memory-api-sampling-group', 'we-memory-api-timeout-group', 'we-memory-api-model-list-group']) {
           const element = document.getElementById(id);
           if (element) element.style.display = follows ? 'none' : '';
         }
+        // 模型组本身是 flex 布局，恢复时要显式写回 flex，不能置空交给默认块级。
+        const modelGroup = document.getElementById('we-memory-api-model-group');
+        if (modelGroup) modelGroup.style.display = follows ? 'none' : 'flex';
         const hint = document.getElementById('we-memory-api-source-hint');
         if (hint) hint.textContent = follows
-          ? '跟随世界引擎：连接方式、URL、Key、温度、输出上限与超时均取世界引擎设置，只需在此选择模型。向量端点不受影响，仍用下方独立配置。'
+          ? '跟随世界引擎：连接方式、URL、Key、模型、温度、输出上限与超时均取世界引擎设置，连接摘要会显示当前模型。向量端点不受影响，仍用下方独立配置。'
           : '此处只配置记忆引擎；请求实现与世界引擎共用，但配置值互不覆盖。若两边相同，可切到「跟随世界引擎」免去重复填写。';
         // 跟随状态摘要：隐藏字段后仍能看到请求实际发往哪里；未保存的切换刷新面板会还原。
         const statusGroup = document.getElementById('we-memory-api-follow-status-group');
@@ -5370,7 +5381,7 @@ window.WORLD_ENGINE_UI = (function() {
           apiSource: apiFollowsWorld ? 'world' : 'own',
           apiUrl: apiFollowsWorld ? (memoryCurrent.apiUrl || '') : (gv('we-api-url') || ''),
           apiKey: apiFollowsWorld ? (memoryCurrent.apiKey || '') : (gv('we-api-key') || ''),
-          model: gv('we-model') || 'gpt-3.5-turbo',
+          model: apiFollowsWorld ? (memoryCurrent.model || 'gpt-3.5-turbo') : (gv('we-model') || 'gpt-3.5-turbo'),
           temperature: Number.isFinite(temperatureRaw) ? Math.max(0, temperatureRaw) : 0.2,
           maxTokens: Math.max(1, parseInt(gv('we-max-tokens')) || 65000),
           apiTimeoutMs: Number.isFinite(timeoutSecRaw) ? Math.max(0, Math.round(timeoutSecRaw * 1000)) : 120000,

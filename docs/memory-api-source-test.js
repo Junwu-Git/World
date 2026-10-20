@@ -3,9 +3,9 @@
 // 直接加载线上 memory-engine-settings.js，通过 WORLD_ENGINE_STORE 提供两侧配置，
 // 覆盖：
 // 1. apiSource='own'（默认）：记忆侧自存配置原样生效，不读世界引擎设置。
-// 2. apiSource='world'：apiUrl/apiKey/connectionMode/temperature/maxTokens/apiTimeoutMs
-//    跟随世界引擎；model 与向量端点保持记忆侧独立。
-// 3. 世界引擎未配置时，跟随模式回退记忆侧已存值，不清空 URL/Key。
+// 2. apiSource='world'：apiUrl/apiKey/model/connectionMode/temperature/maxTokens/apiTimeoutMs
+//    跟随世界引擎；向量端点保持记忆侧独立。
+// 3. 世界引擎未配置时，跟随模式回退记忆侧已存值，不清空 URL/Key/模型。
 // 4. 非法 apiSource 值归一为 own。
 // 5. 请求出口与向量查询重写使用跟随后的连接配置（语义断言）。
 // 6. 保存侧语义：跟随时不写回被跟随字段，切回 own 恢复自存值。
@@ -90,7 +90,7 @@ Object.assign(sandbox, {
 
 await importModule('memory-engine-settings.js');
 const SETTINGS = sandbox.MEMORY_ENGINE_SETTINGS;
-const API_FIELDS = ['apiUrl', 'apiKey', 'connectionMode', 'temperature', 'maxTokens', 'apiTimeoutMs'];
+const API_FIELDS = ['apiUrl', 'apiKey', 'model', 'connectionMode', 'temperature', 'maxTokens', 'apiTimeoutMs'];
 
 const setMemoryStored = value => store.set('memory_engine_settings', JSON.stringify(value));
 const setWorldStored = value => store.set('world_engine_settings', JSON.stringify(value));
@@ -106,7 +106,7 @@ const setWorldStored = value => store.set('world_engine_settings', JSON.stringif
   assert.strictEqual(effective.vectorApiUrl, OWN_HOST + '/embeddings', '向量端点永远独立');
 }
 
-// —— 2. world：跟随字段取世界引擎，model/向量端点保持记忆侧 ——
+// —— 2. world：跟随字段（含 model）取世界引擎，向量端点保持记忆侧 ——
 {
   setMemoryStored({ ...memoryOwn, apiSource: 'world' });
   setWorldStored(worldApi);
@@ -117,7 +117,7 @@ const setWorldStored = value => store.set('world_engine_settings', JSON.stringif
   assert.strictEqual(effective.temperature, 0.7, '跟随模式温度必须取世界引擎');
   assert.strictEqual(effective.maxTokens, 65000, '跟随模式输出上限必须取世界引擎');
   assert.strictEqual(effective.apiTimeoutMs, 120000, '跟随模式超时必须取世界引擎');
-  assert.strictEqual(effective.model, 'memory-model', '跟随模式模型仍由记忆侧独立选择');
+  assert.strictEqual(effective.model, 'world-model', '跟随模式模型必须取世界引擎');
   assert.strictEqual(effective.vectorApiUrl, OWN_HOST + '/embeddings', '跟随模式向量端点不被覆盖');
   assert.strictEqual(effective.vectorApiKey, OWN_VECTOR_CRED, '跟随模式向量 Key 不被覆盖');
 }
@@ -126,11 +126,12 @@ const setWorldStored = value => store.set('world_engine_settings', JSON.stringif
 {
   setMemoryStored({ ...memoryOwn, apiSource: 'world' });
   setWorldStored({
-    apiUrl: '', apiKey: '', connectionMode: '', temperature: '', maxTokens: '', apiTimeoutMs: ''
+    apiUrl: '', apiKey: '', model: '', connectionMode: '', temperature: '', maxTokens: '', apiTimeoutMs: ''
   });
   const effective = SETTINGS.getApiSettings();
   assert.strictEqual(effective.apiUrl, OWN_HOST, '世界引擎 URL 为空时必须回退记忆侧已存值');
   assert.strictEqual(effective.apiKey, OWN_CRED, '世界引擎 Key 为空时必须回退记忆侧已存值');
+  assert.strictEqual(effective.model, 'memory-model', '世界引擎模型为空时必须回退记忆侧已存值');
   assert.strictEqual(effective.connectionMode, 'direct', '世界引擎连接方式为空时回退记忆侧');
   assert.strictEqual(effective.maxTokens, 2000, '世界引擎输出上限为空时回退记忆侧');
   assert.strictEqual(effective.apiTimeoutMs, 60000, '世界引擎超时为空时回退记忆侧');
@@ -143,19 +144,19 @@ const setWorldStored = value => store.set('world_engine_settings', JSON.stringif
   assert.strictEqual(stored.apiSource, 'own', '非法 apiSource 必须归一为 own');
 }
 
-// —— 5. 保存侧语义：跟随时保留自存字段，切回 own 恢复 ——
+// —— 5. 保存侧语义：跟随时保留自存字段（含模型），切回 own 恢复 ——
 {
   setMemoryStored(memoryOwn);
   setWorldStored(worldApi);
   SETTINGS.patchSettings({ apiSource: 'world', model: 'chosen-model' });
   const effective = SETTINGS.getApiSettings();
   assert.strictEqual(effective.apiUrl, WORLD_HOST, '保存后生效 URL 仍跟随世界引擎');
-  assert.strictEqual(effective.model, 'chosen-model', '保存后模型使用新选择');
+  assert.strictEqual(effective.model, 'world-model', '跟随时生效模型必须取世界引擎');
   // 切回 own：保存侧在跟随时未写回自存字段，恢复原值。
   SETTINGS.patchSettings({ apiSource: 'own' });
   const own = SETTINGS.getApiSettings();
   assert.strictEqual(own.apiUrl, OWN_HOST, '切回独立配置必须恢复上次自存 URL');
-  assert.strictEqual(own.model, 'chosen-model', '切回独立配置保留模型选择');
+  assert.strictEqual(own.model, 'chosen-model', '切回独立配置保留记忆侧模型选择');
 }
 
 // —— 6. 请求出口与向量重写的连接参数语义 ——
@@ -166,7 +167,7 @@ const setWorldStored = value => store.set('world_engine_settings', JSON.stringif
   assert.strictEqual(effective.apiUrl, WORLD_HOST, '请求出口的 URL 必须来自生效配置');
   assert.strictEqual(effective.connectionMode, 'proxy', '请求出口的连接方式必须来自生效配置');
   // 向量侧：查询重写同样走生效配置（model 由 vectorRewriteModel 覆盖，maxTokens 固定 600）。
-  const rewriteOverride = { ...effective, model: 'memory-model', maxTokens: 600 };
+  const rewriteOverride = { ...effective, model: 'rewrite-model', maxTokens: 600 };
   assert.strictEqual(rewriteOverride.apiUrl, WORLD_HOST, '查询重写的 URL 必须跟随世界引擎');
   assert.strictEqual(rewriteOverride.apiKey, WORLD_CRED, '查询重写的 Key 必须跟随世界引擎');
   assert.strictEqual(rewriteOverride.vectorApiUrl, OWN_HOST + '/embeddings', '查询重写不改变向量端点');
@@ -178,8 +179,12 @@ const setWorldStored = value => store.set('world_engine_settings', JSON.stringif
   setWorldStored(worldApi);
   assert.strictEqual(SETTINGS.getApiSettings(true, 'world').apiUrl, WORLD_HOST,
     '未保存的「跟随」选择必须立即按世界引擎配置取数');
+  assert.strictEqual(SETTINGS.getApiSettings(true, 'world').model, 'world-model',
+    '未保存的「跟随」选择必须立即按世界引擎模型取数');
   assert.strictEqual(SETTINGS.getApiSettings(true, 'own').apiUrl, OWN_HOST,
     '未保存的「独立」选择必须立即按记忆侧配置取数');
+  assert.strictEqual(SETTINGS.getApiSettings(true, 'own').model, 'memory-model',
+    '未保存的「独立」选择必须立即按记忆侧模型取数');
   assert.strictEqual(SETTINGS.getApiSettings(true, 'bogus').apiUrl, OWN_HOST,
     '非法来源覆盖值必须按已存来源处理');
 }
@@ -214,16 +219,20 @@ const setWorldStored = value => store.set('world_engine_settings', JSON.stringif
   assert.match(ui, /id="we-memory-api-key-group" \$\{followWorld \? 'style="display:none;"' : ''\}/, '跟随模式下 Key 组必须隐藏');
   assert.match(ui, /id="we-memory-api-sampling-group" \$\{followWorld \? 'style="display:none;"' : ''\}/, '跟随模式下温度与输出上限组必须隐藏');
   assert.match(ui, /id="we-memory-api-timeout-group" \$\{followWorld \? 'style="display:none;"' : ''\}/, '跟随模式下超时组必须隐藏');
+  assert.match(ui, /id="we-memory-api-model-group"[^>]*\$\{followWorld \? 'display:none;' : 'display:flex;'\}/, '跟随模式下模型输入与获取列表必须隐藏');
+  assert.match(ui, /id="we-memory-api-model-list-group" \$\{followWorld \? 'style="display:none;"' : ''\}/, '跟随模式下模型下拉列表必须隐藏');
   assert.ok(!/id="we-api-url"[^>]*\$\{followWorld \? 'readonly'/.test(ui), '不得再用只读方式展示被跟随字段');
   // 跟随模式保留可见的连接状态摘要。
   assert.match(ui, /id="we-memory-api-follow-status-group"/, '跟随模式必须给出连接状态摘要');
   assert.match(ui, /function memoryApiFollowStatusText\(\)/, '状态摘要必须抽成可复用函数');
   assert.match(ui, /当前使用世界引擎连接/, '状态摘要必须说明实际连接目标');
+  assert.match(ui, /模型 \$\{model\}/, '状态摘要必须显示跟随后的模型');
   assert.match(ui, /世界引擎尚未配置 API URL/, '世界引擎未配置时必须给出提示');
   // 保存与获取列表分支。
   assert.match(ui, /apiSource: apiFollowsWorld \? 'world' : 'own'/, '保存时必须写入 apiSource');
   assert.match(ui, /apiFollowsWorld \? \(memoryCurrent\.apiUrl \|\| ''\) : \(gv\('we-api-url'\) \|\| ''\)/, '跟随时保存不得写回 URL');
   assert.match(ui, /apiFollowsWorld \? \(memoryCurrent\.apiKey \|\| ''\) : \(gv\('we-api-key'\) \|\| ''\)/, '跟随时保存不得写回 Key');
+  assert.match(ui, /apiFollowsWorld \? \(memoryCurrent\.model \|\| 'gpt-3\.5-turbo'\) : \(gv\('we-model'\) \|\| 'gpt-3\.5-turbo'\)/, '跟随时保存不得写回模型');
   assert.match(ui, /document\.getElementById\('we-memory-api-source'\)\?\.value === 'world'/, '获取列表必须识别跟随模式');
   assert.match(ui, /MEMORY_ENGINE_SETTINGS\?\.getApiSettings/, '跟随模式下获取列表必须改用生效配置');
   assert.match(ui, /本节始终独立配置，不跟随世界引擎/, '向量端点区必须声明不受跟随开关影响');
@@ -231,6 +240,7 @@ const setWorldStored = value => store.set('world_engine_settings', JSON.stringif
   assert.match(ui, /syncApiSourceAvailability/, '来源切换必须即时同步显示状态');
   // 切回独立配置时，隐藏组必须恢复显示（display 置空而非保持 none）。
   assert.match(ui, /element\.style\.display = follows \? 'none' : ''/, '切回独立配置必须恢复被隐藏的字段组');
+  assert.match(ui, /modelGroup\.style\.display = follows \? 'none' : 'flex'/, '切回独立配置必须恢复模型组的 flex 布局');
 }
 
 console.log('memory-api-source-test: 全部通过');
